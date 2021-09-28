@@ -12,6 +12,7 @@ from nwm_routing.__main__ import _run_everything_v02
 from troute.nhd_io import read_custom_input
 import time
 import glob
+import fsspec
 
 '''
 Notes for Mike:
@@ -23,6 +24,45 @@ TODOs:
     * create formal template for evaluation metrics
     * add q_lat time series functionality
 '''
+
+
+def get_qlat_data(comids_list,huc_id, data_type):
+
+    # Set up connectionclient = Client()
+    url = 's3://noaa-nwm-retro-v2-zarr-pds'
+    ds = xr.open_zarr(fsspec.get_mapper(url, anon=True), consolidated=True)
+    
+    # grab var of interest
+    qlat_ts = ds['q_lateral'].sel(time=slice('2010-04-01 00:00','2010-04-30 23:00'))
+    qlat_ts = qlat_ts.drop(labels=['longitude','latitude'])
+    
+    # Subset relevant segments
+    qlat_ts_subset = qlat_ts.sel(feature_id=(comids_list))
+    
+    if data_type == 'max' or data_type == 'all':
+    
+        # Calculate max q_lat over time series
+        qlat_maxwet = qlat_ts_subset.max(dim='time').compute()
+        
+        # Convert to dataframe
+        qlat_maxwet_df = qlat_maxwet.to_dataframe()
+        qlat_maxwet_df.index.name = None
+        # Export as csv
+        qlat_maxwet_df.to_csv(inputs_dir / "v2.1" / 'q_lat' /str('reference_qlat_' + str(data_type) + '_' + str(huc_id) + '.csv'))
+    
+    if data_type == 'ts' or data_type == 'all':
+        
+        # Convert to dataframe
+        qlat_ts_df = qlat_ts_subset.to_dataframe()
+        qlat_ts_df.q_lateral = np.round(qlat_ts_df.q_lateral,3)
+            
+        # Reformat dataframe
+        qlat_ts_df.reset_index(inplace=True)
+        qlat_ts_df_pivot = qlat_ts_df.pivot(index='feature_id', columns='time', values='q_lateral')
+        qlat_ts_df_pivot.index.name = None
+            
+        # Export as csv
+        qlat_ts_df_pivot.to_csv(inputs_dir / "v2.1" / 'q_lat' / str('reference_qlat_' + str(data_type) + '_' + str(huc_id) + '.csv'))
 
 def generate_qlat(refactored_streams, orig_q_lat):
     # generate q_lat time series for new network from NWM v2.1 IDs

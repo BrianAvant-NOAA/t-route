@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 
 huc_id = '01a'
 nts = 288
-testing_dir = '/media/sf_Inland_hydrofabric/testing'
+testing_dir = '/media/sf_inland_routing/testing'
 
 testing_dir = Path(testing_dir)
 
