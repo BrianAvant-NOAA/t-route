@@ -1229,9 +1229,9 @@ cpdef object compute_network_structured(
     cdef int[:] reach_has_gage = np.full(len(reaches_wTypes), np.iinfo(np.int32).min, dtype="int32")
     cdef float[:,:] nudge = np.zeros((gages_size, nsteps + 1), dtype="float32")
 
+    lastobs_times = np.full(gages_size, NAN, dtype="float32")
+    lastobs_values = np.full(gages_size, NAN, dtype="float32")
     if gages_size:
-        lastobs_times = np.zeros(gages_size, dtype="float32")
-        lastobs_values = np.zeros(gages_size, dtype="float32")
         # if da_check_gage > 0:
         #     print(f"gage_i     usgs_positions[gage_i]  usgs_positions_reach[gage_i]  usgs_positions_gage[gage_i]   list(usgs_positions)")
         for gage_i in range(gages_size):
@@ -1351,7 +1351,7 @@ cpdef object compute_network_structured(
                         segment = get_mc_segment(r, _i)
                         flowveldepth[segment.id, timestep, 0] = out_buf[_i, 0]
                         if reach_has_gage[i] == da_check_gage:
-                            printf("segment.id: %d\t", segment.id)
+                            printf("segment.id: %ld\t", segment.id)
                             printf("segment.id: %d\t", usgs_positions[reach_has_gage[i]])
                         flowveldepth[segment.id, timestep, 1] = out_buf[_i, 1]
                         flowveldepth[segment.id, timestep, 2] = out_buf[_i, 2]
@@ -1388,7 +1388,8 @@ cpdef object compute_network_structured(
                         printf("gmxt: %d\t", gage_maxtimestep)
                         printf("gage: %d\t", gage_i)
                         printf("old: %g\t", flowveldepth[usgs_position_i, timestep, 0])
-                        printf("exp_gage_val: %g\t", usgs_values[gage_i,timestep])
+                        printf("exp_gage_val: %g\t", 
+                        NAN if timestep >= gage_maxtimestep else usgs_values[gage_i,timestep],)
 
                     flowveldepth[usgs_position_i, timestep, 0] = da_buf[0]
 
@@ -1412,4 +1413,4 @@ cpdef object compute_network_structured(
     #slice off the initial condition timestep and return
     output = np.asarray(flowveldepth[:,1:,:], dtype='float32')
     #return np.asarray(data_idx, dtype=np.intp), np.asarray(flowveldepth.base.reshape(flowveldepth.shape[0], -1), dtype='float32')
-    return np.asarray(data_idx, dtype=np.intp)[fill_index_mask], output.reshape(output.shape[0], -1)[fill_index_mask]
+    return np.asarray(data_idx, dtype=np.intp)[fill_index_mask], output.reshape(output.shape[0], -1)[fill_index_mask], 0, (np.asarray([data_idx[usgs_position_i] for usgs_position_i in usgs_positions]), np.asarray(lastobs_times), np.asarray(lastobs_values))

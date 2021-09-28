@@ -60,7 +60,7 @@ contains
     !*          with diffusive routing engines
     !
     !*--------------------------------------------------------------------------------
-    subroutine diffnw(dtini_g, t0_g, tfin_g, saveinterval_g, saveinterval_ev_g, dt_ql_g, dt_ub_g, dt_db_g, &
+    subroutine diffnw(dtini_g, t0_g, tfin_g, saveinterval_ev_g, dt_ql_g, dt_ub_g, dt_db_g, &
                         nts_ql_g, nts_ub_g, nts_db_g, &
                         mxncomp_g, nrch_g, z_ar_g, bo_ar_g, traps_ar_g, tw_ar_g, twcc_ar_g, &
                         mann_ar_g, manncc_ar_g, so_ar_g, dx_ar_g, iniq, &
@@ -74,7 +74,7 @@ contains
         integer, intent(in) :: mxncomp_g, nrch_g
         integer, intent(in) :: nts_ql_g, nts_ub_g, nts_db_g, ntss_ev_g
         integer, intent(in) :: nhincr_m_g, nhincr_f_g, frnw_col
-        double precision,intent(in) :: dtini_g, t0_g, tfin_g, saveinterval_g, saveinterval_ev_g, dt_ql_g, dt_ub_g, dt_db_g
+        double precision,intent(in) :: dtini_g, t0_g, tfin_g, saveinterval_ev_g, dt_ql_g, dt_ub_g, dt_db_g
 
         double precision, dimension(mxncomp_g, nrch_g), intent(in) :: z_ar_g, bo_ar_g, traps_ar_g, tw_ar_g, twcc_ar_g
         double precision, dimension(mxncomp_g, nrch_g), intent(in) :: mann_ar_g, manncc_ar_g, dx_ar_g, iniq
@@ -675,16 +675,29 @@ contains
             !        print*, t,i,j,newQ(i,j),newY(i,j)-z(i,j)
             !	 enddo
 	    !end do
+            ! write results, timestep 2 and beyond
             if ( (mod( (t-t0*60.)*60.  ,saveInterval) .le. TOLERANCE) .or. ( t .eq. tfin *60. ) ) then
                 do j = 1, nlinks
                     ncomp= frnw_g(j,1)
                     do i=1, ncomp
-                        q_ev_g(ts_ev, i, j)= newQ(i,j)
-                        elv_ev_g(ts_ev, i, j)= newY(i,j)
+                        q_ev_g(ts_ev+1, i, j)= newQ(i,j)
+                        elv_ev_g(ts_ev+1, i, j)= newY(i,j)
                     enddo
                 enddo
                 ts_ev=ts_ev+1
             end if
+            
+            ! write initial conditions - timestep 1
+            if ( ( t .eq. t0 + dtini/60 ) ) then
+                do j = 1, nlinks
+                    ncomp= frnw_g(j,1)
+                    do i=1, ncomp
+                        q_ev_g(1, i, j)= oldQ(i,j)
+                        elv_ev_g(1, i, j)= oldY(i,j)
+                    enddo
+                enddo
+            end if
+            
               ! update of Y, Q and Area vectors
             oldY   = newY
             newY=-999

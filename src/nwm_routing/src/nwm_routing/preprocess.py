@@ -1,5 +1,7 @@
 import time
 import pandas as pd
+import xarray as xr
+from datetime import datetime
 from collections import defaultdict
 import troute.nhd_network_utilities_v02 as nnu
 import troute.nhd_network as nhd_network
@@ -38,7 +40,9 @@ def nwm_network_preprocess(
         break_network_at_waterbodies = False
 
     if break_network_at_waterbodies:
-        connections = nhd_network.replace_waterbodies_connections(connections, wbody_conn)
+        connections = nhd_network.replace_waterbodies_connections(
+            connections, wbody_conn
+        )
 
     if verbose:
         print("supernetwork connections set complete")
@@ -50,6 +54,8 @@ def nwm_network_preprocess(
     # waterbodies_values = supernetwork_values[12]
     # waterbodies_segments = supernetwork_values[13]
     # connections_tailwaters = supernetwork_values[4]
+
+    waterbody_type_specified = False
 
     if break_network_at_waterbodies:
         # Read waterbody parameters
@@ -64,27 +70,35 @@ def nwm_network_preprocess(
             .set_index("lake_id")
         )
 
-        #Declare empty dataframe
+        # Declare empty dataframe
         waterbody_types_df = pd.DataFrame()
 
-        #Check if hybrid-usgs, hybrid-usace, or rfc type reservoirs are set to true
-        wbtype="hybrid_and_rfc"
-        wb_params_hybrid_and_rfc = waterbody_parameters.get(wbtype, defaultdict(list))  # TODO: Convert these to `get` statments
+        # Check if hybrid-usgs, hybrid-usace, or rfc type reservoirs are set to true
+        wbtype = "hybrid_and_rfc"
+        wb_params_hybrid_and_rfc = waterbody_parameters.get(
+            wbtype, defaultdict(list)
+        )
 
-        wbtype="level_pool"
-        wb_params_level_pool = waterbody_parameters.get(wbtype, defaultdict(list))  # TODO: Convert these to `get` statments
+        wbtype = "level_pool"
+        wb_params_level_pool = waterbody_parameters.get(
+            wbtype, defaultdict(list)
+        )
 
-        waterbody_type_specified = False
-
-        # NOTE: What are we accomplishing with this logic here?
-        if wb_params_hybrid_and_rfc["reservoir_persistence_usgs"] \
-        or wb_params_hybrid_and_rfc["reservoir_persistence_usace"] \
-        or wb_params_hybrid_and_rfc["reservoir_rfc_forecasts"]:
+        # Determine if any data assimilation reservoirs are activated, and if so, read
+        # the reservoir parameter file
+        if (
+            wb_params_hybrid_and_rfc["reservoir_persistence_usgs"]
+            or wb_params_hybrid_and_rfc["reservoir_persistence_usace"]
+            or wb_params_hybrid_and_rfc["reservoir_rfc_forecasts"]
+        ):
 
             waterbody_type_specified = True
 
-            waterbody_types_df = nhd_io.read_reservoir_parameter_file(wb_params_hybrid_and_rfc["reservoir_parameter_file"], \
-                wb_params_level_pool["level_pool_waterbody_id"], wbody_conn.values(),)
+            waterbody_types_df = nhd_io.read_reservoir_parameter_file(
+                wb_params_hybrid_and_rfc["reservoir_parameter_file"],
+                wb_params_level_pool["level_pool_waterbody_id"],
+                wbody_conn.values(),
+            )
 
             # Remove duplicate lake_ids and rows
             waterbody_types_df = (
@@ -94,7 +108,7 @@ def nwm_network_preprocess(
             )
 
     else:
-        #Declare empty dataframes
+        # Declare empty dataframes
         waterbody_types_df = pd.DataFrame()
         waterbodies_df = pd.DataFrame()
 
@@ -111,7 +125,8 @@ def nwm_network_preprocess(
         network_break_segments = network_break_segments.union(gages.keys())
 
     independent_networks, reaches_bytw, rconn = nnu.organize_independent_networks(
-        connections, network_break_segments,
+        connections,
+        network_break_segments,
     )
     if verbose:
         print("reach organization complete")
@@ -135,6 +150,7 @@ def nwm_network_preprocess(
 def nwm_initial_warmstate_preprocess(
     break_network_at_waterbodies,
     restart_parameters,
+    data_assimilation_parameters,
     segment_index,
     waterbodies_df,
     segment_list=None,
@@ -165,10 +181,16 @@ def nwm_initial_warmstate_preprocess(
         else:
             # TODO: Consider adding option to read cold state from route-link file
             waterbodies_initial_ds_flow_const = 0.0
-            waterbodies_initial_depth_const = -1E9
+            waterbodies_initial_depth_const = -1e9
             # Set initial states from cold-state
             waterbodies_initial_states_df = pd.DataFrame(
-                0, index=waterbodies_df.index, columns=["qd0", "h0",], dtype="float32"
+                0,
+                index=waterbodies_df.index,
+                columns=[
+                    "qd0",
+                    "h0",
+                ],
+                dtype="float32",
             )
             # TODO: This assignment could probably by done in the above call
             waterbodies_initial_states_df["qd0"] = waterbodies_initial_ds_flow_const
@@ -177,13 +199,17 @@ def nwm_initial_warmstate_preprocess(
                 len(waterbodies_initial_states_df)
             )
 
+        waterbodies_df = pd.merge(
+            waterbodies_df, waterbodies_initial_states_df, on="lake_id"
+        )
+
         if verbose:
             print("waterbody initial states complete")
         if showtiming:
             print("... in %s seconds." % (time.time() - start_time))
             start_time = time.time()
 
-    # STEP 4: Handle Channel Initial States
+    # STEP 4: Handle Channel Initial States, set T0, and initialize LastObs
     if showtiming:
         start_time = time.time()
     if verbose:
@@ -191,21 +217,29 @@ def nwm_initial_warmstate_preprocess(
 
     q0 = nnu.build_channel_initial_state(restart_parameters, segment_index)
 
+    # STEP 4a: Set Channel States and T0
+    if restart_parameters.get("wrf_hydro_channel_restart_file", None):
+        channel_initial_states_file = restart_parameters[
+            "wrf_hydro_channel_restart_file"
+        ]
+        t0_str = nhd_io.get_param_str(channel_initial_states_file, "Restart_Time")
+    else:
+        t0_str = "2015-08-16_00:00:00"
+
+    t0 = datetime.strptime(t0_str, "%Y-%m-%d_%H:%M:%S")
+
+    # STEP 4b: Set LastObs
+    lastobs_df, da_parameter_dict = nnu.build_data_assimilation_lastobs(
+        data_assimilation_parameters
+    )
+
     if verbose:
         print("channel initial states complete")
     if showtiming:
         print("... in %s seconds." % (time.time() - start_time))
         start_time = time.time()
 
-    # TODO: Does this need to live outside the if-block for waterbodies above? If not, let's move it up there to keep things together.
-    waterbodies_df = pd.merge(
-        waterbodies_df, waterbodies_initial_states_df, on="lake_id"
-    )
-
-    last_obs_file = restart_parameters.get("wrf_hydro_last_obs_file", None)
-    last_obs_df = pd.DataFrame()
-
-    return waterbodies_df, q0, last_obs_df
+    return waterbodies_df, q0, t0, lastobs_df, da_parameter_dict
     # TODO: This returns a full dataframe (waterbodies_df) with the
     # merged initial states for waterbodies, but only the
     # initial state values (q0; not merged with the channel properties)
@@ -218,14 +252,23 @@ def nwm_initial_warmstate_preprocess(
 def nwm_forcing_preprocess(
     run,
     forcing_parameters,
+    da_run,
     data_assimilation_parameters,
     break_network_at_waterbodies,
     segment_index,
+    lastobs_index,
+    warmstate_t0 = None,
     showtiming=False,
     verbose=False,
     debuglevel=0,
 ):
 
+    # TODO: Harmonize the t0 parameter -- this
+    # configuration permits the Warm-State derived
+    # t0 to carry as the default if no other value is
+    # provided -- we need to confirm this is
+    # desireable behavior.
+    t0 = forcing_parameters.get("t0", warmstate_t0)
     nts = forcing_parameters.get("nts", None)
     dt = forcing_parameters.get("dt", None)
     qts_subdivisions = forcing_parameters.get("qts_subdivisions", None)
@@ -234,6 +277,7 @@ def nwm_forcing_preprocess(
     qlat_file_value_col = forcing_parameters.get("qlat_file_value_col", None)
 
     # TODO: find a better way to deal with these defaults and overrides.
+    run["t0"] = run.get("t0", t0)
     run["nts"] = run.get("nts", nts)
     run["dt"] = run.get("dt", dt)
     run["qts_subdivisions"] = run.get("qts_subdivisions", qts_subdivisions)
@@ -241,13 +285,33 @@ def nwm_forcing_preprocess(
     run["qlat_file_index_col"] = run.get("qlat_file_index_col", qlat_file_index_col)
     run["qlat_file_value_col"] = run.get("qlat_file_value_col", qlat_file_value_col)
 
+    if data_assimilation_parameters:
+        data_assimilation_folder = data_assimilation_parameters.get("data_assimilation_timeslices_folder", None)
+        data_assimilation_csv = data_assimilation_parameters.get("data_assimilation_csv", None)
+        lastobs_file = data_assimilation_parameters.get("wrf_hydro_lastobs_file", None)
+        lastobs_start = data_assimilation_parameters.get("wrf_hydro_lastobs_lead_time_relative_to_simulation_start_time", 0)
+        lastobs_type = data_assimilation_parameters.get("wrf_lastobs_type", "error-based")
+        lastobs_crosswalk_file = data_assimilation_parameters.get("wrf_hydro_da_channel_ID_crosswalk_file", None)
+        da_decay_coefficient = data_assimilation_parameters.get("da_decay_coefficient", 120)
+
+        da_run["data_assimilation_timeslices_folder"] = da_run.get("data_assimilation_timeslices_folder", data_assimilation_folder)
+        da_run["data_assimilation_csv"] = da_run.get("data_assimilation_csv", data_assimilation_csv)
+        da_run["wrf_hydro_lastobs_file"] = da_run.get("wrf_hydro_lastobs_file", lastobs_file)
+        da_run["wrf_hydro_lastobs_lead_time_relative_to_simulation_start_time", 0] = da_run.get("wrf_hydro_lastobs_lead_time_relative_to_simulation_start_time", lastobs_start)
+        da_run["wrf_lastobs_type"] = da_run.get("wrf_lastobs_type", lastobs_type)
+        da_run["wrf_hydro_da_channel_ID_crosswalk_file"] = da_run.get("wrf_hydro_da_channel_ID_crosswalk_file", lastobs_crosswalk_file)
+        da_run["da_decay_coefficient"] = da_run.get("da_decay_coefficient", da_decay_coefficient)
+
     # STEP 5: Read (or set) QLateral Inputs
     if showtiming:
         start_time = time.time()
     if verbose:
         print("creating qlateral array ...")
 
-    qlats_df = nnu.build_qlateral_array(run, segment_index,)
+    qlats_df = nnu.build_qlateral_array(
+        run,
+        segment_index,
+    )
 
     if verbose:
         print("qlateral array complete")
@@ -255,16 +319,9 @@ def nwm_forcing_preprocess(
         print("... in %s seconds." % (time.time() - start_time))
 
     # STEP 6
-    data_assimilation_csv = data_assimilation_parameters.get(
-        "data_assimilation_csv", None
-    )
-    data_assimilation_folder = data_assimilation_parameters.get(
-        "data_assimilation_timeslices_folder", None
-    )
-    last_obs_file = data_assimilation_parameters.get(
-        "wrf_hydro_last_obs_file", None
-    )
-    if data_assimilation_csv or data_assimilation_folder or last_obs_file:
+    data_assimilation_csv = da_run.get("data_assimilation_csv", None)
+    data_assimilation_folder = da_run.get("data_assimilation_timeslices_folder", None)
+    if data_assimilation_csv or data_assimilation_folder:
 
         if data_assimilation_folder and data_assimilation_csv:
             print(
@@ -276,9 +333,7 @@ def nwm_forcing_preprocess(
         if verbose:
             print("creating usgs time_slice data array ...")
 
-        usgs_df, lastobs_df, da_parameter_dict = nnu.build_data_assimilation(
-            data_assimilation_parameters
-        )
+        usgs_df = nnu.build_data_assimilation_usgs_df(da_run, lastobs_index, run["t0"])
 
         if verbose:
             print("usgs array complete")
@@ -287,8 +342,6 @@ def nwm_forcing_preprocess(
 
     else:
         usgs_df = pd.DataFrame()
-        lastobs_df = pd.DataFrame()
-        da_parameter_dict = {}
 
     # STEP 7
     coastal_boundary_elev = forcing_parameters.get("coastal_boundary_elev_data", None)
@@ -303,4 +356,4 @@ def nwm_forcing_preprocess(
         coastal_ncdf_df = nhd_io.build_coastal_ncdf_dataframe(coastal_ncdf)
 
     # TODO: disentangle the implicit (run) and explicit (qlats_df, usgs_df) returns
-    return qlats_df, usgs_df, lastobs_df, da_parameter_dict
+    return qlats_df, usgs_df

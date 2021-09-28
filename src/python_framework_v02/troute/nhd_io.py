@@ -183,7 +183,7 @@ def read_reservoir_parameter_file(
         ds = ds.swap_dims({"feature_id": lake_index_field})
 
         ds_new = ds["reservoir_type"]
-       
+
         df1 = ds_new.sel({lake_index_field: list(lake_id_mask)}).to_dataframe()
 
     return df1
@@ -391,16 +391,17 @@ def read_netcdfs(paths, dim, transform_func=None):
 
 def preprocess_time_station_index(xd):
     stationId_da_mask = list(
-        map(compose(bytes.isdigit, bytes.strip), xd.stationId.values)
+        map(compose(bytes.isalnum, bytes.strip), xd.stationId.values)
     )
-    stationId = xd.stationId[stationId_da_mask].values.astype(int)
+    stationId = list(map(bytes.strip, xd.stationId[stationId_da_mask].values))
+    #stationId_int = xd.stationId[stationId_da_mask].values.astype(int)
 
     unique_times_str = np.unique(xd.time.values).tolist()
 
     unique_times = np.array(unique_times_str, dtype="str")
-    
+
     center_time = xd.sliceCenterTimeUTC
-    
+
     tmask = []
     for t in unique_times_str:
         tmask.append(xd.time == t)
@@ -434,14 +435,33 @@ def get_nc_attributes(nc_list, attribute, file_selection=[0, -1]):
 
 
 def get_attribute(nc_file, attribute):
+    # TODO: consider naming as get_nc_attribute
+    # -- this is really specific to a netcdf file.
+
     with xr.open_dataset(nc_file) as xd:
         return xd.attrs[attribute]
 
 
-def build_last_obs_df(
+def build_filtered_gage_df(segment_gage_df, gage_col="gages"):
+    """
+    segment_gage_df - dataframe indexed by segment with at least
+        one column, gage_col, with the gage ids by segment.
+    gage_col - the name of the column containing the gages
+        to filter.
+    """
+    # TODO: use this function to filter the inputs
+    # coming into the da read routines below.
+    gage_list = list(map(bytes.strip, segment_gage_df[gage_col].values))
+    gage_mask = list(map(bytes.isalnum, gage_list))
+    segment_gage_df = segment_gage_df.loc[gage_mask, [gage_col]]
+    segment_gage_df[gage_col] = segment_gage_df[gage_col].map(bytes.strip)
+    return segment_gage_df.to_dict()
+
+
+def build_lastobs_df(
         lastobsfile,
         routelink,
-        wrf_last_obs_flag,
+        wrf_lastobs_flag,
         time_shift = 0,
         gage_id = "gages",
         link_id = "link",
@@ -453,32 +473,36 @@ def build_last_obs_df(
         time_id = "time",
         discharge_nan = -9999.0,
         ref_t_attr_id = "modelTimeAtOutput",
-        blank_filter = b"               ",
         route_link_idx = "feature_id",
         # last_nudge_id = "last_nudge",
     ):
 
     standard_columns = {
-        "last_obs_discharge": obs_discharge_id,
+        "lastobs_discharge": obs_discharge_id,
         "time_since_lastobs": time_id,
         "gages": gage_id,
         "last_model_discharge": model_discharge_id
     }
 
     """
-    Open last_obs file, import the segment keys from the routelink_file
+    Open lastobs file, import the segment keys from the routelink_file
     and extract discharges.
     """
     # TODO: We should already know the link/gage relationship by this point and can require that as an input
     # TODO: ... so we could get rid of the following handful of lines.
     with xr.open_dataset(routelink) as ds1:
-        station_gage_df = ds1[[gage_id,link_id]].to_dataframe()
-        station_gage_df = station_gage_df.loc[station_gage_df[gage_id] != blank_filter]
-        station_gage_df[gage_id] = station_gage_df[gage_id].astype("int")
-        station_gage_df = station_gage_df[[gage_id, link_id]]
-        station_gage_df = station_gage_df.reset_index()
-        station_gage_df = station_gage_df.set_index(gage_id)
-        station_gage_df = station_gage_df.drop(route_link_idx, axis=1)
+        gage_list = list(map(bytes.strip, ds1.gages.values))
+        gage_mask = list(map(bytes.isalnum, gage_list))
+
+        gage_da = list(map(bytes.strip, ds1.gages[gage_mask].values))
+        # gage_da = ds1.gages[gage_mask].values.astype(int)
+
+        data_var_dict = {}
+        data_vars = ("link", "to", "ascendingIndex")
+        for v in data_vars:
+            data_var_dict[v] = (["gages"], ds1[v].values[gage_mask])
+        ds1 = xr.Dataset(data_vars=data_var_dict, coords={"gages": gage_da})
+        station_gage_df = ds1.to_dataframe()
 
     with xr.open_dataset(lastobsfile) as ds:
         model_discharge_last_ts = ds[model_discharge_id][:,-1].to_dataframe()
@@ -514,7 +538,8 @@ def build_last_obs_df(
         lastobs_times = (lastobs_times - ref_time).dt.total_seconds()
         lastobs_times = lastobs_times - time_shift
 
-        lastobs_stations = ds[station_id].to_dataframe().astype(int)
+        lastobs_stations = ds[station_id].to_dataframe()
+        lastobs_stations[station_id] = lastobs_stations[station_id].map(bytes.strip)
 
         ## END OF CONTEXT (Remaining items could be outdented...)
         model_discharge_last_ts = model_discharge_last_ts.join(lastobs_stations)
@@ -533,16 +558,18 @@ def build_last_obs_df(
         model_discharge_last_ts[obs_discharge_id] = model_discharge_last_ts[
             obs_discharge_id
         ].to_frame()
-        # If predict from last_obs file use last obs file results
-        # if last_obs_file == "error-based":
-        # elif last_obs_file == "obs-based":  # the wrf-hydro default
+
+        # TODO: Remove any of the following comments that are no longer needed
+        # If predict from lastobs file use last obs file results
+        # if lastobs_file == "error-based":
+        # elif lastobs_file == "obs-based":  # the wrf-hydro default
         # NOTE:  The following would compare potentially mis-matched
         # obs/model pairs, so it is commented until we can figure out
         # a more robust bias-type persistence.
         # For now, we use only obs-type persistence.
         # It would be possible to preserve a 'last_valid_bias' which would
         # presumably correspond to the last_valid_time.
-        # # if wrf_last_obs_flag:
+        # # if wrf_lastobs_flag:
         # #     model_discharge_last_ts[last_nudge_id] = (
         # #         model_discharge_last_ts[obs_discharge_id]
         # #         - model_discharge_last_ts[model_discharge_id]
@@ -593,71 +620,69 @@ def build_last_obs_df(
         return final_df
 
 
-def get_usgs_from_time_slices_csv(routelink_subset_file, usgs_csv):
+def get_usgs_df_from_csv(usgs_csv, routelink_subset_file, index_col="link"):
+    """
+    routelink_subset_file - provides the gage-->segment crosswalk. Only gages that are represented in the
+    crosswalk will be brought into the evaluation.
+    usgs_csv - csv file with SEGMENT IDs in the left-most column labeled with "link",
+                        and date-headed values from time-slice files in the format
+                        "2018-09-18 00:00:00"
 
-    df2 = pd.read_csv(usgs_csv, index_col=0)
+    It is assumed that the segment crosswalk and interpolation have both
+    already been performed, so we do not need to comprehend
+    the potentially non-numeric byte-strings associated with gage IDs, nor
+    do we need to interpolate anything here as when we read from the timeslices.
+
+    If that were necessary, we might use a solution such as proposed here:
+    https://stackoverflow.com/a/35058538
+    note that explicit typing of the index cannot be done on read and
+    requires a two-line solution such as:
+    ```
+    df2 = pd.read_csv(usgs_csv, dtype={index_col:bytes})
+    df2 = df2.set_index(index_col)
+    ```
+    """
+
+    df2 = pd.read_csv(usgs_csv, index_col=index_col)
 
     with xr.open_dataset(routelink_subset_file) as ds:
         gage_list = list(map(bytes.strip, ds.gages.values))
         gage_mask = list(map(bytes.isdigit, gage_list))
 
-        gage_da = ds.gages[gage_mask].values.astype(int)
+        gage_da = ds[index_col][gage_mask].values.astype(int)
 
         data_var_dict = {}
-        data_vars = ("link", "to", "ascendingIndex")
+        data_vars = ("gages", "to", "ascendingIndex")
         for v in data_vars:
-            data_var_dict[v] = (["gages"], ds[v].values[gage_mask])
-        ds = xr.Dataset(data_vars=data_var_dict, coords={"gages": gage_da})
-    df = ds.to_dataframe()
+            data_var_dict[v] = ([index_col], ds[v].values[gage_mask])
+        ds = xr.Dataset(data_vars=data_var_dict, coords={index_col: gage_da})
+        df = ds.to_dataframe()
 
     usgs_df = df.join(df2)
-    usgs_df = usgs_df.reset_index()
-    usgs_df = usgs_df.rename(columns={"index": "gages"})
-    usgs_df = usgs_df.set_index("link")
     usgs_df = usgs_df.drop(["gages", "ascendingIndex", "to"], axis=1)
-    columns_list = usgs_df.columns
-
-    for i in range(0, (len(columns_list) * 3) - 12, 12):
-        original_string = usgs_df.columns[i]
-        original_string_shortened = original_string[:-5]
-        temp_name1 = original_string_shortened + str("05:00")
-        temp_name2 = original_string_shortened + str("10:00")
-        temp_name3 = original_string_shortened + str("20:00")
-        temp_name4 = original_string_shortened + str("25:00")
-        temp_name5 = original_string_shortened + str("35:00")
-        temp_name6 = original_string_shortened + str("40:00")
-        temp_name7 = original_string_shortened + str("50:00")
-        temp_name8 = original_string_shortened + str("55:00")
-        usgs_df.insert(i + 1, temp_name1, np.nan)
-        usgs_df.insert(i + 2, temp_name2, np.nan)
-        usgs_df.insert(i + 4, temp_name3, np.nan)
-        usgs_df.insert(i + 5, temp_name4, np.nan)
-        usgs_df.insert(i + 7, temp_name5, np.nan)
-        usgs_df.insert(i + 8, temp_name6, np.nan)
-        usgs_df.insert(i + 10, temp_name7, np.nan)
-        usgs_df.insert(i + 11, temp_name8, np.nan)
-
-    usgs_df = usgs_df.interpolate(method="linear", axis=1)
-    usgs_df.drop(usgs_df[usgs_df.iloc[:, 0] == -999999.000000].index, inplace=True)
 
     return usgs_df
 
 
 def get_usgs_from_time_slices_folder(
     routelink_subset_file,
-    usgs_timeslices_folder,
-    data_assimilation_filter,
-    max_fill_1min = 14
+    dt,
+    usgs_files,
+    qc_trehsh,
+    max_fill_1min,
+    t0 = None,
 ):
-    # TODO: Use an explicit list for the files. By this point, the globbing should be complete.
     """
-    routelink_subset_file - provides the gage-->segment crosswalk
-    usgs_timeslices_folder - folder with timeslices
-    data_assimilation_filter - glob pattern for selecting files
+    routelink_subset_file - provides the gage-->segment crosswalk.
+        Only gages that are represented in the
+        crosswalk will be brought into the evaluation.
+    usgs_files - list of "time-slice" files containing observed values
     max_fill_1min - sets the maximum interpolation length
+    t0 - optional date parameter to trim the front of the files -- if not provided,
+          the interpolated values are truncated so that the first value returned
+          corresponds to the first center date of the first provided file.
     """
-    usgs_files = sorted(usgs_timeslices_folder.glob(data_assimilation_filter))
-
+    frequency = str(int(dt/60))+"min"
     with read_netcdfs(usgs_files, "time", preprocess_time_station_index,) as ds2:
 
         # dataframe containing discharge observations
@@ -676,9 +701,10 @@ def get_usgs_from_time_slices_folder(
 
     with xr.open_dataset(routelink_subset_file) as ds:
         gage_list = list(map(bytes.strip, ds.gages.values))
-        gage_mask = list(map(bytes.isdigit, gage_list))
+        gage_mask = list(map(bytes.isalnum, gage_list))
 
-        gage_da = ds.gages[gage_mask].values.astype(int)
+        gage_da = list(map(bytes.strip, ds.gages[gage_mask].values))
+        # gage_da = ds.gages[gage_mask].values.astype(int)
 
         data_var_dict = {}
         data_vars = ("link", "to", "ascendingIndex")
@@ -713,7 +739,7 @@ def get_usgs_from_time_slices_folder(
     date_time_center_end = datetime.strptime(last_center_time, "%Y-%m-%d_%H:%M:%S")
 
     dates = []
-    for j in pd.date_range(date_time_center_start, date_time_center_end, freq="5min"):
+    for j in pd.date_range(date_time_center_start, date_time_center_end, freq=frequency):
         dates.append(j)
 
     """
@@ -739,14 +765,18 @@ def get_usgs_from_time_slices_folder(
     modeled_high = [ 12, 13, 16, 20, 32, 34, 28, 22, 16, 14, 13, 12, 12, 12, 12]
     modeled_shift_late = [ 10, 10, 10, 11, 14, 18, 30, 32, 26, 20, 14, 12, 11, 10, 10]
     modeled_shift_late = [ 11, 14, 18, 30, 32, 26, 20, 14, 12, 11, 10, 10, 10, 10, 10]
-    last_obs = {"obs":9.5, "time":0}  # Most recent observation at simulation start
-    last_obs_old = {"obs":9.5, "time":-3600}  # Most recent observation 1 hour ago
-    last_obs_NaN = {"obs":NaN, "time":NaT}  # No valid recent observation
+    lastobs = {"obs":9.5, "time":0}  # Most recent observation at simulation start
+    lastobs_old = {"obs":9.5, "time":-3600}  # Most recent observation 1 hour ago
+    lastobs_NaN = {"obs":NaN, "time":NaT}  # No valid recent observation
     ```
     """
 
+    #TODO: separate the interpolation into a function; eventually, the data source
+    # could be something other than the time-slice files, but the interpolation
+    # might be the same and the function would facilitate taking advantage of that.
+
     # ---- Laugh testing ------
-    # scren-out erroneous qc flags
+    # screen-out erroneous qc flags
     usgs_qual_df = usgs_qual_df.mask(usgs_qual_df < 0, np.nan)
     usgs_qual_df = usgs_qual_df.mask(usgs_qual_df > 1, np.nan)
 
@@ -768,10 +798,12 @@ def get_usgs_from_time_slices_folder(
     square-wave signals at gages reporting hourly...
     therefore, we use a 59 minute gap filling tolerance.
     """
+    if t0:
+        date_time_center_start = t0
     # TODO: Add reporting interval information to the gage preprocessing (timeslice generation)
     usgs_df_T = (usgs_df_T.resample('min').
                  interpolate(limit = max_fill_1min, limit_direction = 'both').
-                 resample('5min').
+                 resample(frequency).
                  asfreq().
                  loc[date_time_center_start:,:])
 
@@ -779,6 +811,11 @@ def get_usgs_from_time_slices_folder(
     usgs_df_new = usgs_df_T.transpose()
 
     return usgs_df_new
+
+
+def get_param_str(target_file, param):
+    # TODO: remove this duplicate function
+    return get_attribute(target_file, param)
 
 
 # TODO: Move channel restart above usgs to keep order with execution script
@@ -872,6 +909,7 @@ def write_channel_restart_to_wrf_hydro(
     channel_initial_states_file,
     dt_troute,
     nts_troute,
+    t0,
     crosswalk_file,
     channel_ID_column,
     new_extension,
@@ -883,8 +921,8 @@ def write_channel_restart_to_wrf_hydro(
     """
     Write t-route flow and depth data to WRF-Hydro restart files. New WRF-Hydro restart
     files are created that contain all of the data in the original files, plus t-route
-    flow and depth data. 
-    
+    flow and depth data.
+
     Agruments
     ---------
         data (Data Frame): t-route simulated flow, velocity and depth data
@@ -899,18 +937,24 @@ def write_channel_restart_to_wrf_hydro(
         troute_us_flow_var_name (str):
         troute_ds_flow_var_name (str):
         troute_depth_var_name (str):
-        
+
     Returns
     -------
     """
     # create t-route simulation timestamp array
-    with xr.open_dataset(channel_initial_states_file) as ds:
-        t0 = ds.Restart_Time.replace("_", " ")
-    t0 = np.array(t0, dtype=np.datetime64)
+    # TODO: Replace this with a more general function to identify
+    # the model timesteps of a particular run.
+    # consider as a candidate something like:
+    # pd.date_range(start = datetime.strptime('2017-12-31T06:00:00',"%Y-%m-%dT%H:%M:%S"), periods = nts_troute, freq = '300s')
+    # or the equivalent resulting from
+    # pd.date_range(start = np.datetime64('2017-12-31T06:00:00'), periods = nts_troute, freq = '300s')
+    t_array = np.array(t0, dtype=np.datetime64)
     troute_dt = np.timedelta64(dt_troute, "s")
-    troute_timestamps = t0 + np.arange(nts_troute) * troute_dt
+    troute_timestamps = t_array + np.arange(nts_troute) * troute_dt
 
     # extract ordered feature_ids from crosswalk file
+    # TODO: Find out why we re-index this dataset when it
+    # already has a segment index.
     with xr.open_dataset(crosswalk_file) as xds:
         xdf = xds[channel_ID_column].to_dataframe()
     xdf = xdf.reset_index()
@@ -919,6 +963,7 @@ def write_channel_restart_to_wrf_hydro(
     # reindex flowveldepth array
     flowveldepth_reindex = data.reindex(xdf.link)
 
+    # TODO: The comment "revise do this one at a time" appears to be done... is it?
     # get restart timestamps - revise do this one at a time
     for f in restart_files:
         with xr.open_dataset(f) as ds:
@@ -932,6 +977,8 @@ def write_channel_restart_to_wrf_hydro(
             # if the restart timestamp exists in the t-route simulatuion
             if len(a) > 0:
 
+                # TODO: consider Packaging the following into a function
+                # e.g., def get_restart_vals_from_fvd(a, flowveldepth, idx=0,):
                 # pull flow data from flowveldepth array, package into DataArray
                 # !! TO DO - is there a more percise way to slice flowveldepth array?
                 qtrt = (

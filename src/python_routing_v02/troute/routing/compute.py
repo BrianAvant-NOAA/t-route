@@ -15,10 +15,12 @@ from troute.routing.fast_reach.mc_reach import (
     compute_network_structured_obj,
 )
 from troute.routing.fast_reach import diffusive
+from troute.routing.fast_reach import diffusive_cnt
 
 _compute_func_map = defaultdict(
     compute_network,
     {
+        "diffusive_cnt": diffusive_cnt.compute_diffusive_tst,
         "diffusive": diffusive.compute_diffusive_tst,
         "V02-caching": compute_network,
         "V02-diffusive-dummy": compute_network,
@@ -377,7 +379,7 @@ def compute_nhd_routing_v02(
                             np.array(da_positions_list_byreach, dtype="int32"),
                             np.array(da_positions_list_bygage, dtype="int32"),
                             lastobs_df_sub.get(
-                                "last_obs_discharge",
+                                "lastobs_discharge",
                                 pd.Series(index=lastobs_df_sub.index, name="Null"),
                             ).values.astype("float32"),
                             lastobs_df_sub.get(
@@ -588,7 +590,7 @@ def compute_nhd_routing_v02(
                             np.array(da_positions_list_byreach, dtype="int32"),
                             np.array(da_positions_list_bygage, dtype="int32"),
                             lastobs_df_sub.get(
-                                "last_obs_discharge",
+                                "lastobs_discharge",
                                 pd.Series(index=lastobs_df_sub.index, name="Null"),
                             ).values.astype("float32"),
                             lastobs_df_sub.get(
@@ -634,10 +636,11 @@ def compute_nhd_routing_v02(
             print("PARALLEL TIME %s seconds." % (time.time() - start_para_time))
 
     elif parallel_compute_method == "by-subnetwork-diffusive":
+        gages = set(usgs_df.index).intersection(set(param_df.index))
         reaches_ordered_bysubntw, subnetworks, subnetworks_only_ordered_jit = nhd_network.build_subnetworks_btw_reservoirs(
-            connections, rconn, wbody_conn, independent_networks, sources=None
+            connections, rconn, wbody_conn, gages, independent_networks, sources=None
         )
-
+        
         if 1 == 1:
             print("JIT Preprocessing time %s seconds." % (time.time() - start_time))
             print("starting Parallel JIT calculation")
@@ -784,7 +787,7 @@ def compute_nhd_routing_v02(
                             np.array(da_positions_list_byseg, dtype="int32"),
                             np.array(da_positions_list_byreach, dtype="int32"),
                             np.array(da_positions_list_bygage, dtype="int32"),
-                            lastobs_df_sub.get("last_obs_discharge", pd.Series(index=lastobs_df_sub.index, name="Null")).values.astype("float32"),
+                            lastobs_df_sub.get("lastobs_discharge", pd.Series(index=lastobs_df_sub.index, name="Null")).values.astype("float32"),
                             lastobs_df_sub.get("time_since_lastobs", pd.Series(index=lastobs_df_sub.index, name="Null")).values.astype("float32"),
                             da_decay_coefficient,
                             # flowveldepth_interorder,  # obtain keys and values from this dataset
@@ -932,7 +935,7 @@ def compute_nhd_routing_v02(
                         np.array(da_positions_list_byseg, dtype="int32"),
                         np.array(da_positions_list_byreach, dtype="int32"),
                         np.array(da_positions_list_bygage, dtype="int32"),
-                        lastobs_df_sub.get("last_obs_discharge", pd.Series(index=lastobs_df_sub.index, name="Null")).values.astype("float32"),
+                        lastobs_df_sub.get("lastobs_discharge", pd.Series(index=lastobs_df_sub.index, name="Null")).values.astype("float32"),
                         lastobs_df_sub.get("time_since_lastobs", pd.Series(index=lastobs_df_sub.index, name="Null")).values.astype("float32"),
                         da_decay_coefficient,
                         {},
@@ -1050,7 +1053,7 @@ def compute_nhd_routing_v02(
                     np.array(da_positions_list_byseg, dtype="int32"),
                     np.array(da_positions_list_byreach, dtype="int32"),
                     np.array(da_positions_list_bygage, dtype="int32"),
-                    lastobs_df_sub.get("last_obs_discharge", pd.Series(index=lastobs_df_sub.index, name="Null")).values.astype("float32"),
+                    lastobs_df_sub.get("lastobs_discharge", pd.Series(index=lastobs_df_sub.index, name="Null")).values.astype("float32"),
                     lastobs_df_sub.get("time_since_lastobs", pd.Series(index=lastobs_df_sub.index, name="Null")).values.astype("float32"),
                     da_decay_coefficient,
                     {},

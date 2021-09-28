@@ -4,7 +4,7 @@ import pandas as pd
 cimport numpy as np
 from libc.math cimport isnan, NAN
 
-from .fortran_wrappers cimport c_diffnw
+from .fortran_wrappers cimport c_diffnw_cnt
 from .. import diffusive_utils as diff_utils
 import troute.nhd_network_utilities_v02 as nnu
 import troute.nhd_network as nhd_network
@@ -13,7 +13,7 @@ from troute.routing.fast_reach.simple_da cimport obs_persist_shift, simple_da_wi
 # TO DO load some example inputs to test the module
 
 @cython.boundscheck(False)
-cdef void diffnw(double dtini_g,
+cdef void diffnw_cnt(double dtini_g,
              double t0_g,
              double tfin_g,
              double saveinterval_ev_g,
@@ -42,7 +42,7 @@ cdef void diffnw(double dtini_g,
              double[::1,:,:] ufhlt_f_g,
              double[::1,:,:] ufqlt_f_g,
              int frnw_col,
-             double[::1,:] frnw_g,
+             double[::1,:] dfrnw_g,
              double[::1,:,:] qlat_g,
              double[::1,:] ubcd_g,
              double[::1] dbcd_g,
@@ -59,7 +59,7 @@ cdef void diffnw(double dtini_g,
         double[::1,:,:] q_ev_g = np.empty([ntss_ev_g,mxncomp_g,nrch_g], dtype = np.double, order = 'F')
         double[::1,:,:] elv_ev_g = np.empty([ntss_ev_g,mxncomp_g,nrch_g], dtype = np.double, order = 'F')
 
-    c_diffnw(
+    c_diffnw_cnt(
             &dtini_g,
             &t0_g,
             &tfin_g,
@@ -89,7 +89,7 @@ cdef void diffnw(double dtini_g,
             &ufhlt_f_g[0,0,0],
             &ufqlt_f_g[0,0,0],
             &frnw_col,
-            &frnw_g[0,0],
+            &dfrnw_g[0,0],
             &qlat_g[0,0,0],
             &ubcd_g[0,0],
             &dbcd_g[0],
@@ -133,7 +133,7 @@ cpdef object compute_diffusive_tst(
     dict upstream_results={},
     bint assume_short_ts=False,
     bint return_courant=False,
-    dict diffusive_parameters=False
+    dict diffusive_parameters=False,
     ):
 
     # segment connections dictionary
@@ -172,7 +172,7 @@ cpdef object compute_diffusive_tst(
         double dtini_g = diff_inputs["dtini_g"]
         double t0_g = diff_inputs["t0_g"]
         double tfin_g  = diff_inputs["tfin_g"]
-        double saveinterval_ev_g = diff_inputs["saveinterval_tu"]
+        double saveinterval_ev_g = diff_inputs["saveinterval_cnt"]
         double dt_ql_g = diff_inputs["dt_ql_g"]
         double dt_ub_g = diff_inputs["dt_ub_g"]
         double dt_db_g = diff_inputs["dt_db_g"]
@@ -197,7 +197,7 @@ cpdef object compute_diffusive_tst(
         double[::1,:,:] ufhlt_f_g = np.asfortranarray(diff_inputs["ufhlt_f_g"])
         double[::1,:,:] ufqlt_f_g = np.asfortranarray(diff_inputs["ufqlt_f_g"])
         int frnw_col = diff_inputs["frnw_col"]
-        double[::1,:] frnw_g = np.asfortranarray(diff_inputs["frnw_g"], dtype = np.double)
+        double[::1,:] dfrnw_g = np.asfortranarray(diff_inputs["frnw_g"], dtype = np.double)
         double[::1,:,:] qlat_g = np.asfortranarray(diff_inputs["qlat_g"])
         double[::1,:] ubcd_g = np.asfortranarray(diff_inputs["ubcd_g"])
         double[::1] dbcd_g = np.asfortranarray(diff_inputs["dbcd_g"])
@@ -212,7 +212,7 @@ cpdef object compute_diffusive_tst(
         double[:,:,:] out_elv = np.empty([ntss_ev_g,mxncomp_g,nrch_g], dtype = np.double)
 
     # call diffusive compute kernel
-    diffnw(dtini_g,
+    diffnw_cnt(dtini_g,
      t0_g,
      tfin_g,
      saveinterval_ev_g,
@@ -241,7 +241,7 @@ cpdef object compute_diffusive_tst(
      ufhlt_f_g,
      ufqlt_f_g,
      frnw_col,
-     frnw_g,
+     dfrnw_g,
      qlat_g,
      ubcd_g,
      dbcd_g,
@@ -263,7 +263,6 @@ cpdef object compute_diffusive_tst(
                                 )
         
     # re-index the flowveldepth_unorder array returned by diff_utils
-    # TODO return depth not elevation from Tulane model
     flowveldepth_test = np.zeros((data_idx.shape[0], ntss_ev_g*3), dtype='float32')
     flowveldepth_test = (pd.DataFrame(data = flowveldepth_unorder, index = index_array).
                     reindex(index = data_idx).

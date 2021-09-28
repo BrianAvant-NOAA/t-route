@@ -52,7 +52,10 @@ def build_test_parameters(
 
         # Simulation domain RouteLink file
         routelink_file = pathlib.Path(
-            NWM_test_path, "primary_domain", "DOMAIN", "Route_Link.nc",
+            NWM_test_path,
+            "primary_domain",
+            "DOMAIN",
+            "Route_Link.nc",
         ).resolve()
 
         # Speficify WRF hydro restart file, name and destination
@@ -158,7 +161,8 @@ def build_test_parameters(
 
 
 def parity_check(
-    parity_set, results,
+    parity_set,
+    results,
 ):
     nts = parity_set["nts"]
     dt = parity_set["dt"]
@@ -168,6 +172,7 @@ def parity_check(
     parity_check_input_folder = parity_set.get("parity_check_input_folder", None)
     parity_check_file = parity_set.get("parity_check_file", None)
     parity_check_waterbody_file = parity_set.get("parity_check_waterbody_file", None)
+    parity_check_water_elevation = parity_set.get("parity_check_water_elevation", None)
 
     if parity_check_input_folder:
         parity_check_input_folder = pathlib.Path(parity_check_input_folder)
@@ -201,9 +206,14 @@ def parity_check(
         validation_data = pd.read_csv(
             parity_set["parity_check_waterbody_file"], index_col=0
         )
-        validation_data.rename(columns={"outflow": compare_node}, inplace=True)
+
+        if not parity_check_water_elevation:
+            validation_data.rename(columns={"outflow": compare_node}, inplace=True)
         # TODO: Add toggle option to compare water elevation
-        # validation_data.rename(columns = {"water_sfc_elev":compare_node}, inplace = True)
+        else:
+            validation_data.rename(
+                columns={"water_sfc_elev": compare_node}, inplace=True
+            )
         validation_data = validation_data[[compare_node]]
         validation_data.index = validation_data.index.astype("datetime64[ns]")
         validation_data = validation_data.transpose()
@@ -240,30 +250,51 @@ def parity_check(
     time_wrf = validation_data.columns.values
 
     if compare_node in validation_data.index:
+        print(f"Comparing flows at {compare_node}")
 
         # construct comparable dataframes
-        trt = pd.DataFrame(
-            flows.loc[:, compare_node].values,
-            # TODO: Add toggle option to compare water elevation
-            # depths.loc[:, compare_node].values,
-            index=time_routing,
-            columns=["flow, t-route (cms)"],
-        )
-        wrf = pd.DataFrame(
-            validation_data.loc[compare_node, :].values,
-            index=time_wrf,
-            columns=["flow, wrf (cms)"],
-        )
+        if not parity_check_water_elevation:
+            trt = pd.DataFrame(
+                flows.loc[:, compare_node].values,
+                index=time_routing,
+                columns=["flow, t-route (cms)"],
+            )
+            wrf = pd.DataFrame(
+                validation_data.loc[compare_node, :].values,
+                index=time_wrf,
+                columns=["flow, wrf (cms)"],
+            )
+
+        else:
+            trt = pd.DataFrame(
+                depths.loc[:, compare_node].values,
+                index=time_routing,
+                columns=["flow, t-route (cms)"],
+                # TODO: Consider having another compare dataframes
+                #      block below with water elevation labels?
+                # columns=["water elevation, t-route (m)"],
+            )
+            wrf = pd.DataFrame(
+                validation_data.loc[compare_node, :].values,
+                index=time_wrf,
+                columns=["flow, wrf (cms)"],
+                # TODO: Consider having another compare dataframes
+                #      block below with water elevation labels?
+                # columns=["water elevation, wrf (m)"],
+            )
 
         # compare dataframes
         compare = pd.concat([wrf, trt], axis=1, sort=False, join="inner")
-        compare["diff"] = compare["flow, wrf (cms)"] - compare["flow, t-route (cms)"]
-        compare["rel_diff"] = (compare["flow, wrf (cms)"] - compare["flow, t-route (cms)"]) / compare["flow, wrf (cms)"]
+        compare["diff"] = compare["flow, t-route (cms)"] - compare["flow, wrf (cms)"]
+        compare["rel_diff"] = (
+            compare["flow, t-route (cms)"] - compare["flow, wrf (cms)"]
+        ) / compare["flow, wrf (cms)"]
         compare["absdiff"] = np.abs(
-            compare["flow, wrf (cms)"] - compare["flow, t-route (cms)"]
+            compare["flow, t-route (cms)"] - compare["flow, wrf (cms)"]
         )
         compare["rel_absdiff"] = np.abs(
-            (compare["flow, wrf (cms)"] - compare["flow, t-route (cms)"]) / compare["flow, wrf (cms)"]
+            (compare["flow, t-route (cms)"] - compare["flow, wrf (cms)"])
+            / compare["flow, wrf (cms)"]
         )
 
         print(compare)

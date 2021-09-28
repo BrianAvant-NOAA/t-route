@@ -1,9 +1,14 @@
 import argparse
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 from pathlib import Path
+import numpy as np
 import pandas as pd
+import math
+
+import asyncio
+import concurrent.futures
 
 ## network and reach utilities
 import troute.nhd_network as nhd_network
@@ -373,7 +378,9 @@ def _run_everything_v02(
         supernetwork_parameters
     )
     if break_network_at_waterbodies:
-        connections = nhd_network.replace_waterbodies_connections(connections, wbody_conn)
+        connections = nhd_network.replace_waterbodies_connections(
+            connections, wbody_conn
+        )
 
     if verbose:
         print("supernetwork connections set complete")
@@ -401,26 +408,35 @@ def _run_everything_v02(
             .set_index("lake_id")
         )
 
-        #Declare empty dataframe
+        # Declare empty dataframe
         waterbody_types_df = pd.DataFrame()
 
-        #Check if hybrid-usgs, hybrid-usace, or rfc type reservoirs are set to true
-        wbtype="hybrid_and_rfc"
-        wb_params_hybrid_and_rfc = waterbody_parameters.get(wbtype, defaultdict(list))  # TODO: Convert these to `get` statments
+        # Check if hybrid-usgs, hybrid-usace, or rfc type reservoirs are set to true
+        wbtype = "hybrid_and_rfc"
+        wb_params_hybrid_and_rfc = waterbody_parameters.get(
+            wbtype, defaultdict(list)
+        )  # TODO: Convert these to `get` statments
 
-        wbtype="level_pool"
-        wb_params_level_pool = waterbody_parameters.get(wbtype, defaultdict(list))  # TODO: Convert these to `get` statments
+        wbtype = "level_pool"
+        wb_params_level_pool = waterbody_parameters.get(
+            wbtype, defaultdict(list)
+        )  # TODO: Convert these to `get` statments
 
         waterbody_type_specified = False
 
-        if wb_params_hybrid_and_rfc["reservoir_persistence_usgs"] \
-        or wb_params_hybrid_and_rfc["reservoir_persistence_usace"] \
-        or wb_params_hybrid_and_rfc["reservoir_rfc_forecasts"]:
+        if (
+            wb_params_hybrid_and_rfc["reservoir_persistence_usgs"]
+            or wb_params_hybrid_and_rfc["reservoir_persistence_usace"]
+            or wb_params_hybrid_and_rfc["reservoir_rfc_forecasts"]
+        ):
 
             waterbody_type_specified = True
 
-            waterbody_types_df = nhd_io.read_reservoir_parameter_file(wb_params_hybrid_and_rfc["reservoir_parameter_file"], \
-                wb_params_level_pool["level_pool_waterbody_id"], wbody_conn.values(),)
+            waterbody_types_df = nhd_io.read_reservoir_parameter_file(
+                wb_params_hybrid_and_rfc["reservoir_parameter_file"],
+                wb_params_level_pool["level_pool_waterbody_id"],
+                wbody_conn.values(),
+            )
 
             # Remove duplicate lake_ids and rows
             waterbody_types_df = (
@@ -430,7 +446,7 @@ def _run_everything_v02(
             )
 
     else:
-        #Declare empty dataframe
+        # Declare empty dataframe
         waterbody_types_df = pd.DataFrame()
         waterbodies_df = pd.DataFrame()
 
@@ -446,7 +462,8 @@ def _run_everything_v02(
     if break_network_at_gages:
         network_break_segments = network_break_segments.union(gages.keys())
     independent_networks, reaches_bytw, rconn = nnu.organize_independent_networks(
-        connections, network_break_segments,
+        connections,
+        network_break_segments,
     )
     if verbose:
         print("reach organization complete")
@@ -474,10 +491,16 @@ def _run_everything_v02(
         else:
             # TODO: Consider adding option to read cold state from route-link file
             waterbodies_initial_ds_flow_const = 0.0
-            waterbodies_initial_depth_const = -1E9
+            waterbodies_initial_depth_const = -1e9
             # Set initial states from cold-state
             waterbodies_initial_states_df = pd.DataFrame(
-                0, index=waterbodies_df.index, columns=["qd0", "h0",], dtype="float32"
+                0,
+                index=waterbodies_df.index,
+                columns=[
+                    "qd0",
+                    "h0",
+                ],
+                dtype="float32",
             )
             # TODO: This assignment could probably by done in the above call
             waterbodies_initial_states_df["qd0"] = waterbodies_initial_ds_flow_const
@@ -503,6 +526,15 @@ def _run_everything_v02(
         print("setting channel initial states ...")
 
     q0 = nnu.build_channel_initial_state(restart_parameters, param_df.index)
+    # STEP 4a: Set Channel States and T0
+    if restart_parameters.get("wrf_hydro_channel_restart_file",None):
+        channel_initial_states_file = restart_parameters["wrf_hydro_channel_restart_file"]
+        t0_str = nhd_io.get_param_str(channel_initial_states_file, "Restart_Time")
+    else:
+        t0_str = "2015-08-16_00:00:00"
+
+    t0 = datetime.strptime(t0_str, "%Y-%m-%d_%H:%M:%S")
+    run_parameters["t0"] = t0
 
     if verbose:
         print("channel initial states complete")
@@ -537,18 +569,17 @@ def _run_everything_v02(
     data_assimilation_folder = data_assimilation_parameters.get(
         "data_assimilation_timeslices_folder", None
     )
-    last_obs_file = data_assimilation_parameters.get(
-        "wrf_hydro_last_obs_file", None
-    )
+    lastobs_file = data_assimilation_parameters.get("wrf_hydro_lastobs_file", None)
 
-    if data_assimilation_csv or data_assimilation_folder or last_obs_file:
+    if data_assimilation_csv or data_assimilation_folder or lastobs_file:
         if showtiming:
             start_time = time.time()
         if verbose:
             print("creating usgs time_slice data array ...")
 
             usgs_df, lastobs_df, da_parameter_dict = nnu.build_data_assimilation(
-                data_assimilation_parameters
+                data_assimilation_parameters,
+                run_parameters
             )
 
         if verbose:
@@ -628,6 +659,7 @@ def _handle_output_v02(
     ################### Output Handling
     dt = run_parameters.get("dt", None)
     nts = run_parameters.get("nts", None)
+    t0 = run_parameters.get("t0", None)
     verbose = run_parameters.get("verbose", None)
     showtiming = run_parameters.get("showtiming", None)
     debuglevel = run_parameters.get("debuglevel", 0)
@@ -740,6 +772,7 @@ def _handle_output_v02(
                 restart_parameters.get("wrf_hydro_channel_restart_file"),
                 run_parameters.get("dt"),
                 run_parameters.get("nts"),
+                t0,
                 restart_parameters.get("wrf_hydro_channel_ID_crosswalk_file"),
                 restart_parameters.get(
                     "wrf_hydro_channel_ID_crosswalk_file_field_name"
@@ -751,8 +784,12 @@ def _handle_output_v02(
             str = "WRF Hydro restart files not found - Aborting restart write sequence"
             raise AssertionError(str)
 
-    chrtout_read_folder = output_parameters.get("wrf_hydro_channel_output_source_folder", None)
-    chrtout_write_folder = output_parameters.get("wrf_hydro_channel_final_output_folder", chrtout_read_folder)
+    chrtout_read_folder = output_parameters.get(
+        "wrf_hydro_channel_output_source_folder", None
+    )
+    chrtout_write_folder = output_parameters.get(
+        "wrf_hydro_channel_final_output_folder", chrtout_read_folder
+    )
     if chrtout_read_folder:
         qvd_columns = pd.MultiIndex.from_product(
             [range(nts), ["q", "v", "d"]]
@@ -802,7 +839,8 @@ def _handle_output_v02(
         parity_parameters["dt"] = dt
 
         build_tests.parity_check(
-            parity_parameters, results,
+            parity_parameters,
+            results,
         )
 
         if verbose:
@@ -893,6 +931,10 @@ def nwm_route(
 
 
 def new_nwm_q0(run_results):
+    """
+    Prepare a new q0 dataframe with initial flow and depth to act as
+    a warmstate for the next simulation chunk.
+    """
     return pd.concat(
         # TODO: we only need two fields, technically, and the restart file produced by WRF-Hydro
         # actually contains a field qu0, which is never used for restart (the qu0 can be obtained
@@ -911,7 +953,77 @@ def new_nwm_q0(run_results):
     )
 
 
+def get_waterbody_water_elevation(waterbodies_df, q0):
+    """
+    Update the starting water_elevation of each lake/reservoir
+    with depth values from q0
+    """
+    waterbodies_df.update(q0)
+
+    return waterbodies_df
+
+
+def update_lookback_hours(dt, nts, waterbody_parameters):
+    """
+    Update the lookback hours that an RFC type reservoir searches in reverse
+    from the model start time to find a time series file. The update is based
+    on the total hours ran in the prior loop.
+    """
+
+    waterbody_parameters['hybrid_and_rfc']['reservoir_rfc_forecasts_lookback_hours'] = \
+    waterbody_parameters['hybrid_and_rfc']['reservoir_rfc_forecasts_lookback_hours'] + \
+    math.ceil((dt * nts) / 3600)
+
+    return waterbody_parameters
+
+
+def new_lastobs(run_results, time_increment):
+    """
+    Creates new "lastobs" dataframe for the next simulation chunk.
+
+    run_results - output from the compute kernel sequence, organized
+        (because that is how it comes out of the kernel) by network.
+        For each item in the result, there are four elements, the
+        fourth of which is a tuple containing: 1) a list of the
+        segments ids where data assimilation was performed (if any)
+        in that network; 2) a list of the last valid observation
+        applied at that segment; 3) a list of the time in seconds
+        from the beginning of the last simulation that the
+        observation was applied.
+    time_increment - length of the prior simulation. To prepare the
+        next lastobs state, we have to convert the time since the prior
+        simulation start to a time since the new simulation start.
+        If the most recent observation was right at the end of the
+        prior loop, then the value in the incoming run_result will
+        be equal to the time_increment and the output value will be
+        zero. If observations were not present at the last timestep,
+        the last obs time will be calculated to a negative value --
+        the number of seconds ago that the last valid observation
+        was used for assimilation.
+    """
+    df = pd.concat(
+        [
+            pd.DataFrame(
+                # TODO: Add time_increment (or subtract?) from time_since_lastobs
+                np.array([rr[3][1],rr[3][2]]).T,
+                index=rr[3][0],
+                columns=["time_since_lastobs", "lastobs_discharge"]
+            )
+            for rr in run_results
+            if not rr[3][0].size == 0
+        ],
+        copy=False,
+    )
+    df["time_since_lastobs"] = df["time_since_lastobs"] - time_increment
+    return df
+
+
 def main_v03(argv):
+    """
+    Handles the creation of the input parameter dictionaries
+    from an input file and then sequences the execution of the
+    t-route routing agorithm on a series of execution loops.
+    """
     args = _handle_args_v03(argv)
     (
         log_parameters,
@@ -953,9 +1065,10 @@ def main_v03(argv):
     )
 
     # TODO: This function modifies one of its arguments (waterbodies_df), which is somewhat poor practice given its otherwise functional nature. Consider refactoring
-    waterbodies_df, q0, lastobs_df = nwm_initial_warmstate_preprocess(
+    waterbodies_df, q0, t0, lastobs_df, da_parameter_dict = nwm_initial_warmstate_preprocess(
         break_network_at_waterbodies,
         restart_parameters,
+        data_assimilation_parameters,
         param_df.index,
         waterbodies_df,
         segment_list=None,
@@ -970,9 +1083,11 @@ def main_v03(argv):
     # TODO: Make this more flexible.
     run_sets = forcing_parameters.get("qlat_forcing_sets", False)
 
-    # TODO: Data Assimilation will be something like the parity block
-    # if DA:
-    #     da_sets = [BIG LIST OF DA BLOCKS]
+    if "data_assimilation_parameters" in compute_parameters:
+        if "data_assimilation_sets" in data_assimilation_parameters:
+            da_sets = data_assimilation_parameters.get("data_assimilation_sets", [])
+        else:
+            da_sets = [{} for _ in run_sets]
 
     if "wrf_hydro_parity_check" in output_parameters:
         parity_sets = parity_parameters.get("parity_check_compare_file_sets", [])
@@ -987,12 +1102,15 @@ def main_v03(argv):
     assume_short_ts = compute_parameters.get("assume_short_ts", False)
     return_courant = compute_parameters.get("return_courant", False)
 
-    qlats, usgs_df, lastobs_df, da_parameter_dict = nwm_forcing_preprocess(
+    qlats, usgs_df = nwm_forcing_preprocess(
         run_sets[0],
         forcing_parameters,
+        da_sets[0] if data_assimilation_parameters else {},
         data_assimilation_parameters,
         break_network_at_waterbodies,
         param_df.index,
+        lastobs_df.index,
+        t0,
         showtiming,
         verbose,
         debuglevel,
@@ -1000,6 +1118,7 @@ def main_v03(argv):
 
     for run_set_iterator, run in enumerate(run_sets):
 
+        t0 = run.get("t0")
         dt = run.get("dt")
         nts = run.get("nts")
 
@@ -1038,30 +1157,42 @@ def main_v03(argv):
             debuglevel,
         )
 
-        if (
-            run_set_iterator < len(run_sets) - 1
-        ):  # No forcing to prepare for the last loop
-            qlats, usgs_df, lastobs_dict, da_parameter_dict = nwm_forcing_preprocess(
+        # No forcing to prepare for the last loop
+        if run_set_iterator < len(run_sets) - 1:
+            qlats, usgs_df = nwm_forcing_preprocess(
                 run_sets[run_set_iterator + 1],
                 forcing_parameters,
+                da_sets[run_set_iterator + 1] if data_assimilation_parameters else {},
                 data_assimilation_parameters,
                 break_network_at_waterbodies,
                 param_df.index,
+                lastobs_df.index,
+                t0 + timedelta(seconds = dt * nts),
                 showtiming,
                 verbose,
                 debuglevel,
             )
 
-            # q0 = run_results
             q0 = new_nwm_q0(run_results)
 
+            if data_assimilation_parameters:
+                lastobs_df = new_lastobs(run_results, dt * nts)
+
+            # TODO: Confirm this works with Waterbodies turned off
+            waterbodies_df = get_waterbody_water_elevation(waterbodies_df, q0)
+
+            if waterbody_type_specified:
+                waterbody_parameters = update_lookback_hours(dt, nts, waterbody_parameters)
+
         nwm_output_generator(
+            run,
             run_results,
             supernetwork_parameters,
             output_parameters,
             parity_parameters,
+            restart_parameters,
             parity_sets[run_set_iterator] if parity_parameters else {},
-            nts,
+            qts_subdivisions,
             compute_parameters.get("return_courant", False),
             showtiming,
             verbose,
@@ -1069,6 +1200,300 @@ def main_v03(argv):
         )
 
     # nwm_final_output_generator()
+
+    if verbose:
+        print("process complete")
+    if showtiming:
+        print("%s seconds." % (time.time() - main_start_time))
+
+
+async def main_v03_async(argv):
+    """
+    Handles the creation of the input parameter dictionaries
+    from an input file and then sequences the execution of the
+    t-route routing agorithm on a series of execution loops.
+    """
+    args = _handle_args_v03(argv)  # async shares input framework with non-async
+    (
+        log_parameters,
+        supernetwork_parameters,
+        waterbody_parameters,
+        compute_parameters,
+        forcing_parameters,
+        restart_parameters,
+        diffusive_parameters,
+        output_parameters,
+        parity_parameters,
+        data_assimilation_parameters,
+    ) = _input_handler_v03(args)
+
+    verbose = log_parameters.get("verbose", None)
+    showtiming = log_parameters.get("showtiming", None)
+    debuglevel = log_parameters.get("debuglevel", 0)
+
+    if showtiming:
+        main_start_time = time.time()
+
+    (
+        connections,
+        param_df,
+        wbody_conn,
+        waterbodies_df,
+        waterbody_types_df,
+        break_network_at_waterbodies,
+        waterbody_type_specified,
+        independent_networks,
+        reaches_bytw,
+        rconn,
+    ) = nwm_network_preprocess(
+        supernetwork_parameters,
+        waterbody_parameters,
+        showtiming=showtiming,
+        verbose=verbose,
+        debuglevel=debuglevel,
+    )
+
+    # TODO: This function modifies one of its arguments (waterbodies_df), which is somewhat poor practice given its otherwise functional nature. Consider refactoring
+    waterbodies_df, q0, t0, lastobs_df, da_parameter_dict = nwm_initial_warmstate_preprocess(
+        break_network_at_waterbodies,
+        restart_parameters,
+        data_assimilation_parameters,
+        param_df.index,
+        waterbodies_df,
+        segment_list=None,
+        wbodies_list=None,
+        showtiming=showtiming,
+        verbose=verbose,
+        debuglevel=debuglevel,
+    )
+
+    # The inputs below assume a very pedantic setup
+    # with each run set explicitly defined, so...
+    # TODO: Make this more flexible.
+    run_sets = forcing_parameters.get("qlat_forcing_sets", False)
+
+    if "data_assimilation_parameters" in compute_parameters:
+        if "data_assimilation_sets" in data_assimilation_parameters:
+            da_sets = data_assimilation_parameters.get("data_assimilation_sets", [])
+        else:
+            da_sets = [{} for _ in run_sets]
+
+    if "wrf_hydro_parity_check" in output_parameters:
+        parity_sets = parity_parameters.get("parity_check_compare_file_sets", [])
+    else:
+        parity_sets = []
+
+    parallel_compute_method = compute_parameters.get("parallel_compute_method", None)
+    subnetwork_target_size = compute_parameters.get("subnetwork_target_size", 1)
+    # TODO: Determine parameterization of the CPU and Threading pools
+    # TODO: Make sure default values from dict.get for pool sizes work
+    # e.g., is this valid: `ThreadPoolExecutor(max_workers=None)`?
+    COMPUTE_cpu_pool = compute_parameters.get("cpu_pool", None)
+    # IO_cpu_pool = compute_parameters.get("cpu_pool_IO", None)
+    IO_cpu_pool = COMPUTE_cpu_pool
+    qts_subdivisions = forcing_parameters.get("qts_subdivisions", 1)
+    compute_kernel = compute_parameters.get("compute_kernel", "V02-caching")
+    assume_short_ts = compute_parameters.get("assume_short_ts", False)
+    return_courant = compute_parameters.get("return_courant", False)
+
+    FORCE_KERNEL_THREAD = False
+    if FORCE_KERNEL_THREAD:
+        pool_IO = None
+        pool_Processing = None
+    else:
+        pool_IO = concurrent.futures.ThreadPoolExecutor(max_workers=IO_cpu_pool)
+        pool_Processing = concurrent.futures.ThreadPoolExecutor(max_workers=COMPUTE_cpu_pool)
+
+    loop = asyncio.get_running_loop()
+
+    forcings_task = loop.run_in_executor(
+        pool_IO,
+        nwm_forcing_preprocess,
+        run_sets[0],
+        forcing_parameters,
+        da_sets[0] if data_assimilation_parameters else {},
+        data_assimilation_parameters,
+        break_network_at_waterbodies,
+        param_df.index,
+        lastobs_df.index,
+        t0,
+        showtiming,
+        verbose,
+        debuglevel,
+    )
+
+    run_set_iterator = 0
+    for run_set_iterator, run in enumerate(run_sets[:-1]):
+
+        t0 = run.get("t0")
+        dt = run.get("dt")
+        nts = run.get("nts")
+
+        qlats, usgs_df = await forcings_task
+
+        # TODO: confirm utility of visual parity check in async execution
+        if parity_sets:
+            parity_sets[run_set_iterator]["dt"] = dt
+            parity_sets[run_set_iterator]["nts"] = nts
+
+        model_task = loop.run_in_executor(
+            pool_Processing,
+            nwm_route,
+            connections,
+            rconn,
+            wbody_conn,
+            reaches_bytw,
+            parallel_compute_method,
+            compute_kernel,
+            subnetwork_target_size,
+            COMPUTE_cpu_pool,
+            dt,
+            nts,
+            qts_subdivisions,
+            independent_networks,
+            param_df,
+            q0,
+            qlats,
+            usgs_df,
+            lastobs_df,
+            da_parameter_dict,
+            assume_short_ts,
+            return_courant,
+            waterbodies_df,
+            waterbody_parameters,
+            waterbody_types_df,
+            waterbody_type_specified,
+            diffusive_parameters,
+            showtiming,
+            verbose,
+            debuglevel,
+        )
+
+        forcings_task = loop.run_in_executor(
+            pool_IO,
+            nwm_forcing_preprocess,
+            run_sets[run_set_iterator + 1],
+            forcing_parameters,
+            da_sets[run_set_iterator + 1] if data_assimilation_parameters else {},
+            data_assimilation_parameters,
+            break_network_at_waterbodies,
+            param_df.index,
+            lastobs_df.index,
+            t0 + timedelta(seconds = dt * nts),
+            showtiming,
+            verbose,
+            debuglevel,
+        )
+
+        run_results = await model_task
+
+        q0 = new_nwm_q0(run_results)
+
+        if data_assimilation_parameters:
+            lastobs_df = new_lastobs(run_results, dt * nts)
+
+        # TODO: Confirm this works with Waterbodies turned off
+        waterbodies_df = get_waterbody_water_elevation(waterbodies_df, q0)
+
+        if waterbody_type_specified:
+            waterbody_parameters = update_lookback_hours(dt, nts, waterbody_parameters)
+
+        output_task = loop.run_in_executor(
+            pool_IO,
+            nwm_output_generator,
+            run,
+            run_results,
+            supernetwork_parameters,
+            output_parameters,
+            parity_parameters,
+            restart_parameters,
+            parity_sets[run_set_iterator] if parity_parameters else {},
+            qts_subdivisions,
+            compute_parameters.get("return_courant", False),
+            showtiming,
+            verbose,
+            debuglevel,
+        )
+
+    # For the last loop, no next forcing or warm state is needed for execution.
+    run_set_iterator += 1
+    run = run_sets[run_set_iterator]
+
+    t0 = run.get("t0")
+    dt = run.get("dt")
+    nts = run.get("nts")
+
+    qlats, usgs_df = await forcings_task
+
+    # TODO: confirm utility of visual parity check in async execution
+    if parity_sets:
+        parity_sets[run_set_iterator]["dt"] = dt
+        parity_sets[run_set_iterator]["nts"] = nts
+
+    model_task = loop.run_in_executor(
+        pool_Processing,
+        nwm_route,
+        connections,
+        rconn,
+        wbody_conn,
+        reaches_bytw,
+        parallel_compute_method,
+        compute_kernel,
+        subnetwork_target_size,
+        COMPUTE_cpu_pool,
+        dt,
+        nts,
+        qts_subdivisions,
+        independent_networks,
+        param_df,
+        q0,
+        qlats,
+        usgs_df,
+        lastobs_df,
+        da_parameter_dict,
+        assume_short_ts,
+        return_courant,
+        waterbodies_df,
+        waterbody_parameters,
+        waterbody_types_df,
+        waterbody_type_specified,
+        diffusive_parameters,
+        showtiming,
+        verbose,
+        debuglevel,
+    )
+
+    # nwm_final_output_generator()
+    run_results = await model_task
+
+    # These warmstates are never used for modeling, but
+    # should be availble for last outputs.
+    q0 = new_nwm_q0(run_results)
+
+    if data_assimilation_parameters:
+        lastobs_df = new_lastobs(run_results, dt * nts)
+
+    waterbodies_df = get_waterbody_water_elevation(waterbodies_df, q0)
+
+    if waterbody_type_specified:
+        waterbody_parameters = update_lookback_hours(dt, nts, waterbody_parameters)
+
+    output_task = await loop.run_in_executor(
+        pool_IO,
+        nwm_output_generator,
+        run,
+        run_results,
+        supernetwork_parameters,
+        output_parameters,
+        parity_parameters,
+        restart_parameters,
+        parity_sets[run_set_iterator] if parity_parameters else {},
+        qts_subdivisions,
+        compute_parameters.get("return_courant", False),
+        showtiming,
+        verbose,
+        debuglevel,
+    )
 
     if verbose:
         print("process complete")
@@ -1089,6 +1514,9 @@ def main_v03(argv):
                   if next forcing prepared
         """
 
+    pool_IO.shutdown(wait=True)
+    pool_Processing.shutdown(wait=True)
+
 
 if __name__ == "__main__":
     v_parser = argparse.ArgumentParser(
@@ -1099,11 +1527,15 @@ if __name__ == "__main__":
         "--input-version",
         default=3,
         nargs="?",
-        choices=[2, 3],
+        choices=[2, 3, 4],
         type=int,
         help="Use version 2 or 3 of the input format. Default 3",
     )
     v_args = v_parser.parse_known_args()
+    if v_args[0].input_version == 4:
+        coroutine = main_v03_async(v_args[1])
+        asyncio.run(coroutine)
+        # loop.run_until_complete(coroutine)
     if v_args[0].input_version == 3:
         main_v03(v_args[1])
     if v_args[0].input_version == 2:

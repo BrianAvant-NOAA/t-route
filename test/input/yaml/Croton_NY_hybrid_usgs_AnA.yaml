@@ -1,7 +1,7 @@
 ---
 #initial input parameters
 run_parameters:
-    #parallel_compute_method: by-network  # OPTIONS: <omit flag for serial execution>, "by-network", "by-subnetwork-jit", "by-subnetwork-jit-clustered"
+    parallel_compute_method: by-network  # OPTIONS: <omit flag for serial execution>, "by-network", "by-subnetwork-jit", "by-subnetwork-jit-clustered"
     # subnetwork_target_size: 100  # by-subnetwork* requires a value here to identify the target subnetwork size.
     verbose: true  # verbose output (leave blank for quiet output.)
     showtiming: true  # set the showtiming (omit flag for no timing information.)
@@ -68,13 +68,13 @@ waterbody_parameters:
 
     hybrid_and_rfc:
         # Specify the reservoir parameter file
-        reservoir_parameter_file: "../../test/input/geo/NWM_2.1_Sample_Datasets/Croton_NY_TEST1/primary_domain/DOMAIN/reservoir_index_croton_ny_rfc.nc"
+        reservoir_parameter_file: "../../test/input/geo/NWM_2.1_Sample_Datasets/Croton_NY_TEST1/primary_domain/DOMAIN/reservoir_index_croton_ny_hybrid_usgs.nc"
 
         # If using USGS persistence reservoirs, set to True. (default=.FALSE.)
-        reservoir_persistence_usgs: False
+        reservoir_persistence_usgs: True
 
         # Specify the path to the timeslice files to be used by USGS reservoirs
-        reservoir_usgs_timeslice_path: "../../test/input/geo/NWM_2.1_Sample_Datasets/Croton_NY_TEST1/observations/"
+        reservoir_usgs_timeslice_path: "../../test/input/geo/NWM_2.1_Sample_Datasets/Croton_NY_TEST1/observations/looping_AnA/"
 
         # If using USACE persistence reservoirs, set to True. (default=.FALSE.)
         reservoir_persistence_usace: False
@@ -88,10 +88,10 @@ waterbody_parameters:
         # Specify update time interval in seconds to read new reservoir observation data
         # The default is 86400 (seconds per day). Set to 3600 for standard and extended AnA simulations.
         # Set to 1000000000 for short range and medium range forecasts.
-        reservoir_observation_update_time_interval_seconds: 1000000000
+        reservoir_observation_update_time_interval_seconds: 3600
 
         # If using RFC forecast reservoirs, set to True. (default=.FALSE.)
-        reservoir_rfc_forecasts: True
+        reservoir_rfc_forecasts: False
 
         # Specify the path to the RFC time series files to be used by reservoirs
         reservoir_rfc_forecasts_time_series_path: "../../test/input/geo/NWM_2.1_Sample_Datasets/Croton_NY_TEST1/observations/"
@@ -125,13 +125,8 @@ parity_parameters:
     #parity_check_file: "../../test/input/geo/NWM_2.1_Sample_Datasets/Croton_NY_TEST1/example_CHRTOUT/streamflow_croton_levelpool.csv"
     #parity_check_compare_node: 6227150 #Stream
     #Use two lines below for parity check on reservoir/waterbody and comment out two lines above
-    parity_check_waterbody_file: "../../test/input/geo/NWM_2.1_Sample_Datasets/Croton_NY_TEST1/waterbodies/reservoir_outflow_croton_rfc_nudge_off.csv"
+    parity_check_waterbody_file: "../../test/input/geo/NWM_2.1_Sample_Datasets/Croton_NY_TEST1/waterbodies/reservoir_outflow_croton_usgs_persistence_AnA.csv"
     parity_check_compare_node: 6228110 #Reservoir - only reservoir in domain
     #Uncomment below to parity check the reservoir's water elevation instead
     #of outflow
-    #NOTE: For this Croton NY RFC test, the water elevation does not pass the parity
-    #      check because the original wrf test was conducted with the reservoir's
-    #      water elevation balanced from the level pool outflow and not the assimilated
-    #      RFC forecasted outflow. The current updated version in t-route balances
-    #      the reservoir's water elevation with the assimilated RFC forecasted outflow.
     #parity_check_water_elevation: true
