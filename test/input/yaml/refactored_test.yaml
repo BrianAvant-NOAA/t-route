@@ -60,8 +60,8 @@ supernetwork_parameters:
     layer_string: Refactored
 # Q-Lateral inputs from hydrology model
 forcing_parameters:
-    #qlat_input_file: "../../test/input/florence_933020089/FORCING/SeptemberFlorenceQlateral_wDates.csv"
-    qlat_const: 0.1
+    # qlat_input_file: "../../test/input/florence_933020089/FORCING/SeptemberFlorenceQlateral_wDates.csv"
+    # qlat_const: 0.1
     # WRF-Hydro files in comments below for example
     # qlat_input_folder: "../../test/input/florence_933020089/Full_Model_Run/OUTPUT/"
     # qlat_file_pattern_filter: "/201809*.CHRTOUT_DOMAIN1"

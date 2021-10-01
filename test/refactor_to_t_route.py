@@ -12,13 +12,10 @@ from shared_functions import generate_qlat, recalculate_flows, convert_results_t
 
 '''
 Notes for Mike:
-    * mising segments in route link file (maybe OCONUS?, adding the 'alt' and 'NHDWaterbodyComID' fields on your end should resolve this)
+    * mising segments in route link file
     * reference hydrofabirc formatting: can we run the same processing script on the reference fabric to generate similar attributes
-    * not fully understanding the proportional weighting notaion; I will need this to calculate q_lat time series for the refactored hydrofabric (and currently adding attributes)
 TODOs:
-    * package scripts into continuous workflow from refactored to t-route
     * create formal template for evaluation metrics
-    * add q_lat time series functionality
 '''
 
 
