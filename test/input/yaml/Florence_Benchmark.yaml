@@ -2,7 +2,7 @@
 # Initial input parameters
 run_parameters:
     parallel_compute_method: by-subnetwork-jit-clustered
-    compute_kernel: V02-caching #V02-structured
+    compute_kernel: V02-caching #V02-caching #V02-structured
     verbose: true
     showtiming: true
     debuglevel: 1
@@ -35,7 +35,7 @@ output_parameters:
 supernetwork_parameters:
     title_string: Florencee_updated_repo_test #Custom Input Example (using Florence-Event Cutout datafile)
     geo_file_path: "../../test/input/florence_933020089/DOMAIN/Route_Link.nc"
-    # mask_file_path: "../../test/input/geo/Channels/masks/933020089_mask.csv"
+    mask_file_path: "../../test/input/geo/Channels/masks/933020089_mask.csv"
     mask_layer_string: ""
     mask_driver_string: "csv"
     mask_key: 0
@@ -60,8 +60,7 @@ supernetwork_parameters:
     layer_string: 0
 # Q-Lateral inputs from hydrology model
 forcing_parameters:
-    #qlat_input_file: "../../test/input/florence_933020089/FORCING/SeptemberFlorenceQlateral_wDates.csv"
-    qlat_const: 0.1
+    qlat_input_file: "../../test/input/florence_933020089/FORCING/SeptemberFlorenceQlateral_wDates.csv"
     # WRF-Hydro files in comments below for example
     # qlat_input_folder: "../../test/input/florence_933020089/Full_Model_Run/OUTPUT/"
     # qlat_file_pattern_filter: "/201809*.CHRTOUT_DOMAIN1"
