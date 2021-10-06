@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 from evaluate_reference_hydrofabric import eval_reference_hydrofabric
 from shared_functions import generate_qlat, recalculate_flows, convert_results_to_df, run_troute_from_script, add_routelink_attributes, split_routelink_waterbodies, clean_dataset, replace_line, create_cn_summary_table
-
+import gc
 '''
 Notes for Mike:
     * mising segments in route link file
@@ -19,7 +19,7 @@ TODOs:
 '''
 
 
-def run_troute(huc_id,nts,testing_dir,qlat_type):
+def run_troute(nts,testing_dir,qlat_type, huc_id):
 
     '''
     1. Populate a refactored stream network with channel routing properties from NWM v2.1 route link file.
@@ -36,7 +36,6 @@ def run_troute(huc_id,nts,testing_dir,qlat_type):
     '''
 
     testing_dir = Path(testing_dir)
-    # default_yaml_filename = testing_dir / 'refactored_test.yaml'
 
     inputs_dir = testing_dir / "inputs"
     routlink_netcdf_filename = inputs_dir / "v2.1" / 'RouteLink_CONUS.nc'
@@ -45,20 +44,24 @@ def run_troute(huc_id,nts,testing_dir,qlat_type):
                
     outputs_dir = testing_dir / "outputs" / str(huc_id)
     if not Path(outputs_dir).is_dir():
-        os.mkdir(Path(outputs_dir))
-    # aggregate_cn_table_filename = outputs_dir / 'aggregate_cn_table.csv'
+        os.makedirs(Path(outputs_dir))
+        
     aggregate_cn_summary_table_filename = outputs_dir / 'aggregate_cn_summary_table.csv'
     
     diagnostic_dir = outputs_dir / 'diagnostic'
     if not Path(diagnostic_dir).is_dir():
-        os.mkdir(Path(diagnostic_dir))
+        os.makedirs(Path(diagnostic_dir))
     else: 
         files = list(diagnostic_dir.glob('**/*.json'))
         for f in files:
             os.remove(f)
 
     # Calculate base metrics
-    default_yaml_filename = inputs_dir / 'yaml' / str('reference_' + huc_id + '.yaml')
+    yaml_dir = inputs_dir / 'yaml'
+    if not Path(yaml_dir).is_dir():
+        os.makedirs(Path(yaml_dir))
+    
+    default_yaml_filename = yaml_dir / str('reference_' + huc_id + '.yaml')
     if not os.path.isfile(default_yaml_filename):
         
         eval_reference_hydrofabric(testing_dir,qlat_type, huc_id)
@@ -93,26 +96,53 @@ def run_troute(huc_id,nts,testing_dir,qlat_type):
         refactored_streams = split_routelink_waterbodies(refactored_streams) # TODO: develop a method for consolidating lake features
         
         if refactored_streams.NHDWaterbodyComID.dtype != 'int': refactored_streams.NHDWaterbodyComID = refactored_streams.NHDWaterbodyComID.astype(int)
-            
-        # Save updated gpkg
-        clean_up_dir = inputs_dir / "refactored_cleaned_up"
-        if not clean_up_dir.is_dir():
-            os.mkdir(clean_up_dir)
-        refactored_streams_filename = Path(clean_up_dir) / hydrofabric
-        refactored_streams.to_file(refactored_streams_filename, layer='refactored',driver='GPKG')
         
-        # Create refactored q_lats
-        orig_q_lat_filename = inputs_dir / "v2.1" / "q_lat" / str('reference_qlat_' + str(qlat_type) + '_' + str(huc_id) + '.csv')
-        orig_q_lat = pd.read_csv(orig_q_lat_filename)
-        refactored_q_lat, qlat_ids_missing_parameters, qlat_fraction_dict = generate_qlat(refactored_streams, orig_q_lat) # , qlat_comid_set
+        # Create refactored qlats
+        orig_qlat_filename = inputs_dir / "v2.1" / "q_lat" / str('reference_qlat_' + str(qlat_type) + '_' + str(huc_id) + '.csv')
+        orig_qlat = pd.read_csv(orig_qlat_filename)
+        refactored_qlat, qlat_ids_missing_parameters, qlat_fraction_dict = generate_qlat(refactored_streams, orig_qlat) # , qlat_comid_set
         
         with open(Path(diagnostic_dir / str(hydrofabric + '_qlat_fraction_dict.json')), 'w') as f:
             json.dump(qlat_fraction_dict, f)
             
+        refactored_qlat.index = refactored_qlat.index.astype(str).astype(int)
+        qlat_ids_missing_parameters = [int(x) for x in qlat_ids_missing_parameters]
+        missing_from_qlat = list(set(refactored_qlat.index) - set(refactored_streams.link))
+        missing_from_croswalk = list(set(refactored_streams.link) - set(refactored_qlat.index))
+        print (f"missing refactored qlat data for {len(missing_from_croswalk)} segments")
+           
+        # temp unitl reference IDs get cleared up
+        refactored_streams = refactored_streams.loc[~refactored_streams.link.isin(missing_from_croswalk)]
+        refactored_streams = refactored_streams.set_index('link')
+        refactored_streams['link'] = refactored_streams.index
+        refactored_streams.index.name = None
+        
+        # Save updated gpkg
+        clean_up_dir = inputs_dir / "refactored_cleaned_up" / str(huc_id)
+        if not clean_up_dir.is_dir():
+            os.makedirs(clean_up_dir)
+        refactored_streams_filename = Path(clean_up_dir) / hydrofabric
+        refactored_streams.to_file(refactored_streams_filename, layer='refactored',driver='GPKG')
+       
         # Export as csv
         hydrofabric_version, layer_type = hydrofabric.split('.')
         refactored_qlat_filename = str(hydrofabric_version) + '_qlat_' + str(qlat_type) + '_' + str(huc_id) + '.csv'
-        refactored_q_lat.to_csv(inputs_dir / "v2.1" / 'q_lat' / refactored_qlat_filename)
+        refactored_qlat.to_csv(inputs_dir / "v2.1" / 'q_lat' / refactored_qlat_filename)
+        
+        if len(missing_from_croswalk) > 0:
+            with open(Path(diagnostic_dir / str(hydrofabric_version + '_refactor_ids_missing_from_xwlak.lst')), 'w') as f:
+                for item in missing_from_croswalk:
+                    f.write("%s\n" % item)
+        
+        if len(missing_from_qlat) > 0:
+            with open(Path(diagnostic_dir / str(hydrofabric_version + '_refactor_ids_missing_from_qlat.lst')), 'w') as f:
+                for item in missing_from_qlat:
+                    f.write("%s\n" % item)
+        
+        if len(qlat_ids_missing_parameters) > 0:
+            with open(Path(diagnostic_dir / str(hydrofabric_version + '_nwm_ids_missing_qlat.lst')), 'w') as f:
+                for item in qlat_ids_missing_parameters:
+                    f.write("%s\n" % item)
             
         ## Create t-route input file
         yaml_dict = {}
@@ -163,15 +193,16 @@ def run_troute(huc_id,nts,testing_dir,qlat_type):
             cn_summary_table.to_csv(aggregate_cn_summary_table_filename,index=False)
 
         del refactored_streams, t_route_results, fvd, courant, tidy_network_cn
+        # collected = gc.collect()
 
 if __name__ == '__main__':
 
     # Parse arguments.
     parser = argparse.ArgumentParser(description='Run t-route routing algorithms and calculate metrics')
-    parser.add_argument('-huc', '--huc-id', help='HUC2 ID',required=True,type=str)
     parser.add_argument('-nts', '--nts', help='number of timesteps',required=True,type=int)
     parser.add_argument('-d', '--testing-dir', help='testing directory',required=True)
     parser.add_argument('-qlat_type', '--qlat-type', help='q_lat data type (timeseries or max)',required=False,default='ts')
+    parser.add_argument('-huc', '--huc-id', help='HUC2 ID',required=True,type=str)
 
     # Extract to dictionary and assign to variables.
     args = vars(parser.parse_args())

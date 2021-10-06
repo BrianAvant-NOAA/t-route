@@ -14,6 +14,7 @@ import time
 import glob
 import seaborn as sns
 import matplotlib.pyplot as plt
+import gc
 
 huc_id = '01a'
 nts = 288
@@ -39,8 +40,24 @@ diagnostic_dir = outputs_dir / 'diagnostic'
 aggregate_cn_summary_table = pd.read_csv(aggregate_cn_summary_table_filename)
 
 
-### Plots
 
+# Aggregate outputs from all HUCs 
+
+# Subset missing ids from reference hydrofabic
+refactored_params = 'ngen_reference_01a.gpkg'
+with open(diagnostic_dir / 'rf_s10000_m500_c500_nwm_ids_missing_qlat.lst', "r") as f:
+    missing_hucs = f.read().splitlines()
+
+missing_hucs = [int(i) for i in missing_hucs]
+reference_hydrofabric = gpd.read_file(nwm_v2_1_streams_filename,layer='flowpaths')
+reference_hydrofabric.COMID = reference_hydrofabric.COMID.astype(int)
+
+missing_ids_gpkg = reference_hydrofabric.loc[reference_hydrofabric.COMID.isin(missing_hucs)]
+missing_ids_gpkg.shape
+len(missing_hucs)
+missing_ids_gpkg.to_file(testing_dir / 'missing_ids_01a.gpkg',driver='GPKG')
+
+### Plots
 sns.set(style="ticks", rc={"grid.linewidth": 0.1})
 sns.set_context("paper", font_scale=2)
 

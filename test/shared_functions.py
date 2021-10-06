@@ -2,6 +2,8 @@
 
 import pandas as pd
 import numpy as np
+import warnings
+warnings.simplefilter(action='ignore', category=RuntimeWarning)
 import xarray as xr
 from nwm_routing.__main__ import _run_everything_v02
 from troute.nhd_io import read_custom_input
@@ -12,7 +14,7 @@ def generate_qlat(refactored_streams, orig_qlat):
     orig_qlat = orig_qlat.rename(columns={orig_qlat.columns[0]: 'ID'})
     # Convert time series columns to list
     qlat_ts_list = orig_qlat.to_numpy().tolist()
-    # create dict with ID: list of qlat time series
+    # Create dict with ID: list of qlat time series
     qlat_dict_b = dict((str(int(l[0])), l[1:]) for l in qlat_ts_list)
     
     refact_qlat_dict = {}
@@ -51,7 +53,6 @@ def generate_qlat(refactored_streams, orig_qlat):
                         fraction_dict[i] = fraction
                     
                 if i not in qlat_dict_b.keys():
-                    print(f"segment ID {int(i)} is not in qlat file")
                     orig_ids_missing_qlat = orig_ids_missing_qlat + [i]
                 
                 else:
@@ -82,7 +83,6 @@ def generate_qlat(refactored_streams, orig_qlat):
 
             # Copy channel properties            
             if i not in qlat_dict_b.keys():
-                print(f"segment ID {int(i)} is not in qlat file")
                 orig_ids_missing_qlat = orig_ids_missing_qlat + [i]
 
             else:
@@ -104,7 +104,7 @@ def generate_qlat(refactored_streams, orig_qlat):
     return refactored_qlat, orig_ids_missing_qlat, fraction_dict # , orig_id_set
 
 
-def recalculate_flows(new_network_flows, q_lat_sample_path):
+def recalculate_flows(new_network_flows, qlat_sample_path):
     # generate Q time series for NWM v2.1 network IDs from troute
     print ('coming soon')
 

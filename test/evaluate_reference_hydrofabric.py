@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 import fsspec
 from shared_functions import replace_line, run_troute_from_script, convert_results_to_df, create_cn_summary_table, clean_dataset
+import gc
 
 '''
 Retrieve q_lat values for each segment (https://registry.opendata.aws/nwm-archive/)
@@ -36,15 +37,15 @@ def eval_reference_hydrofabric(testing_dir,qlat_type,huc_id):
     if huc_id==None:
         reference_hydrofabrics = os.listdir(nwm_v2_1_streams_streams_dir)
     else:
-        reference_hydrofabrics = list(nwm_v2_1_streams_streams_dir / str('ngen_reference_' + str(huc_id) + '.gpkg'))
+        reference_hydrofabrics = [str('ngen_reference_' + str(huc_id) + '.gpkg')]
     
     yaml_dir = inputs_dir / 'yaml'
     if not Path(yaml_dir).is_dir():
-        os.mkdir(Path(yaml_dir))
-    else: 
-        files = list(yaml_dir.glob('**/*.yaml'))
-        for f in files:
-            os.remove(f)
+        os.makedirs(Path(yaml_dir))
+    # else: 
+    #     files = list(yaml_dir.glob('**/*.yaml'))
+    #     for f in files:
+    #         os.remove(f)
             
     # Calculate base metrics
     for reference_hydrofabric in reference_hydrofabrics:
@@ -55,22 +56,18 @@ def eval_reference_hydrofabric(testing_dir,qlat_type,huc_id):
         
         outputs_dir = testing_dir / "outputs" / str(huc_id)
         if not Path(outputs_dir).is_dir():
-            os.mkdir(Path(outputs_dir))
+            os.makedirs(Path(outputs_dir))
             
         aggregate_cn_summary_table_filename = outputs_dir / 'aggregate_cn_summary_table.csv'
         nwm_v2_1_streams_subset_filename = outputs_dir / str("routlink_" + str(huc_id) + ".gpkg")
         
         diagnostic_dir = outputs_dir / 'diagnostic'
         if not Path(diagnostic_dir).is_dir():
-            os.mkdir(Path(diagnostic_dir))
-        else: 
-            files = list(diagnostic_dir.glob('**/*.json'))
-            for f in files:
-                os.remove(f)
+            os.makedirs(Path(diagnostic_dir))
         
-        nwm_v2_1_streams = gpd.read_file(nwm_v2_1_streams_filename,layername='flowpaths') # ,dtype={'NHDWaterbodyComID':str}
-        if nwm_v2_1_streams.featureid.dtype != 'int': nwm_v2_1_streams.featureid = nwm_v2_1_streams.featureid.astype(int)
-        subset_ids = nwm_v2_1_streams.featureid.to_list()
+        nwm_v2_1_streams = gpd.read_file(nwm_v2_1_streams_filename,layer='flowpaths')
+        if nwm_v2_1_streams.COMID.dtype != 'int': nwm_v2_1_streams.COMID = nwm_v2_1_streams.COMID.astype(int)
+        subset_ids = nwm_v2_1_streams.COMID.to_list()
         
         routlink_netcdf = xr.open_dataset(routlink_netcdf_filename)
         routlink_df = routlink_netcdf.to_dataframe()
@@ -126,7 +123,7 @@ def eval_reference_hydrofabric(testing_dir,qlat_type,huc_id):
                 
         del qlat_ts_subset
         
-        subset_routelink = nwm_v2_1_streams[['featureid','geometry']].merge(subset_routelink, left_on=['featureid'], right_on=['link'])
+        subset_routelink = nwm_v2_1_streams[['COMID','geometry']].merge(subset_routelink, left_on=['COMID'], right_on=['link'])
              
         subset_routelink = subset_routelink.drop(columns=['gages'])
         
@@ -157,12 +154,7 @@ def eval_reference_hydrofabric(testing_dir,qlat_type,huc_id):
         cn_summary_table.to_csv(aggregate_cn_summary_table_filename,index=False)
     
         del nwm_v2_1_streams, subset_routelink, t_route_results, fvd, courant, tidy_network_cn
-    
-        # # Write out CN values to aggregate table
-        # if os.path.isfile(aggregate_cn_table_filename):
-        #     tidy_network_cn.to_csv(aggregate_cn_table_filename,index=False, mode='a',header=False)
-        # else:
-        #     tidy_network_cn.to_csv(aggregate_cn_table_filename,index=False)
+        # collected = gc.collect()
     
     
 if __name__ == '__main__':
