@@ -3,7 +3,7 @@
 
 repo_dir=t-route/test/
 testing_dir='/media/sf_inland_routing/testing'
-huc_id='01a'
+huc='01a'
 nts=288
 
 # get q_lat timeseries data

@@ -5,6 +5,8 @@ import numpy as np
 import warnings
 warnings.simplefilter(action='ignore', category=RuntimeWarning)
 import xarray as xr
+import sys
+sys.path.append('/t-route/src/nwm_routing/src')
 from nwm_routing.__main__ import _run_everything_v02
 from troute.nhd_io import read_custom_input
 

@@ -77,3 +77,19 @@ plt.plot(aggregate_cn_summary_table["Network"][1:],aggregate_cn_summary_table["N
 plt.set_axis_labels(x_var="Network", y_var="Number of Segments Violating CN")
 # Adjust the arrangement of the plots
 grid.fig.tight_layout(w_pad=1)
+
+## aggregate summary tables for all RPUs
+output_dir = "/data/outputs"
+rpu_dir = os.listdir(output_dir)
+full_calibration_table = "/t-route/full_calibration_table.csv"
+
+for huc in rpu_dir:
+    summary_table_filename = output_dir / huc / 'aggregate_cn_summary_table.csv'
+    summary_table = pd.read_csv(summary_table_filename)
+    
+    # Write/append aggregate summary table
+    if os.path.isfile(full_calibration_table):
+        summary_table.to_csv(full_calibration_table,index=False, mode='a',header=False)
+    else:
+        summary_table.to_csv(full_calibration_table,index=False)
+    
