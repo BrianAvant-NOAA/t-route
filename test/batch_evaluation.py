@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import argparse
 from pathlib import Path
 import os
+import sys
 from os.path import join
 from concurrent.futures import ProcessPoolExecutor
 from refactor_to_t_route import run_troute
@@ -9,7 +11,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=RuntimeWarning)
 
 
-def batch_evaluation(nts,testing_dir,qlat_type,huc_id,workers):
+def batch_evaluation(nts,testing_dir,qlat_type,workers):
 
     testing_dir = Path(testing_dir)
     refactored_streams_dir = testing_dir / 'inputs' / "refactored"
@@ -37,7 +39,6 @@ if __name__ == '__main__':
     parser.add_argument('-nts', '--nts', help='number of timesteps',required=True,type=int)
     parser.add_argument('-d', '--testing-dir', help='testing directory',required=True)
     parser.add_argument('-qlat_type', '--qlat-type', help='q_lat data type (timeseries or max)',required=False,default='ts')
-    parser.add_argument('-huc', '--huc-id', help='HUC2 ID',required=True,type=str)
     parser.add_argument('-workers', '--workers', help='Number of jobs to run',required=False,default=1,type=int)
 
     # Extract to dictionary and assign to variables.

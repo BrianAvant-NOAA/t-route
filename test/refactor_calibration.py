@@ -83,9 +83,12 @@ output_dir = "/data/outputs"
 rpu_dir = os.listdir(output_dir)
 full_calibration_table = "/t-route/full_calibration_table.csv"
 
-for huc in rpu_dir:
-    summary_table_filename = output_dir / huc / 'aggregate_cn_summary_table.csv'
+for rpu in rpu_dir:
+    summary_table_filename = output_dir / rpu / 'aggregate_cn_summary_table.csv'
     summary_table = pd.read_csv(summary_table_filename)
+
+    if len(os.listdir(output_dir / rpu)) < 9:
+        print (f"RPU {rpu} missing outputs")
     
     # Write/append aggregate summary table
     if os.path.isfile(full_calibration_table):
