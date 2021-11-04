@@ -150,6 +150,12 @@ def eval_reference_hydrofabric(testing_dir,qlat_type,huc_id):
     
         network = 'reference_' + huc_id
         cn_summary_table = create_cn_summary_table(tidy_network_cn, subset_routelink, network)
+
+        # Write/append aggregate summary table
+        if os.path.isfile(aggregate_cn_summary_table_filename):
+            cn_summary_table.to_csv(aggregate_cn_summary_table_filename,index=False, mode='a',header=False)
+        else:
+            cn_summary_table.to_csv(aggregate_cn_summary_table_filename,index=False)
     
         cn_summary_table.to_csv(aggregate_cn_summary_table_filename,index=False)
     

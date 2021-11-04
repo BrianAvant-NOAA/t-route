@@ -18,7 +18,7 @@ import gc
 
 huc_id = '01a'
 nts = 288
-testing_dir = '/media/sf_inland_routing/testing'
+testing_dir = '/data/testing'
 
 testing_dir = Path(testing_dir)
 
@@ -79,15 +79,29 @@ plt.set_axis_labels(x_var="Network", y_var="Number of Segments Violating CN")
 grid.fig.tight_layout(w_pad=1)
 
 ## aggregate summary tables for all RPUs
+import os
+import pandas as pd
+import json
+from pathlib import Path
+input_dir = "/data/inputs/v2.1/ngen-reference"
+reference_dir = os.listdir(input_dir)
 output_dir = "/data/outputs"
 rpu_dir = os.listdir(output_dir)
-full_calibration_table = "/t-route/full_calibration_table.csv"
+
+full_calibration_table = "/data/full_calibration_table.csv"
+
 
 for rpu in rpu_dir:
-    summary_table_filename = output_dir / rpu / 'aggregate_cn_summary_table.csv'
+    
+    summary_table_filename = Path(output_dir) / rpu / 'aggregate_cn_summary_table.csv'
     summary_table = pd.read_csv(summary_table_filename)
-
-    if len(os.listdir(output_dir / rpu)) < 9:
+    
+    # summary_table = summary_table.set_index('Network')
+    # summary_table = summary_table.drop(index=str("reference_"+ rpu))
+    # summary_table.reset_index(inplace=True)
+    # summary_table.to_csv(summary_table_filename,index=False)
+    
+    if len(os.listdir(Path(output_dir) / rpu)) < 9:
         print (f"RPU {rpu} missing outputs")
     
     # Write/append aggregate summary table
