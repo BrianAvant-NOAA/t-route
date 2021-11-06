@@ -310,16 +310,16 @@ def create_cn_summary_table(courant_results, stream_network, network):
 
     cn_summary_table = pd.DataFrame({
                                     'Network': [network],
-                                    'Min Segment Length (m)': np.round(stream_network.Length.min(),2),
-                                    'Max Segment Length (m)': np.round(stream_network.Length.max(),2),
-                                    'Avg Segment Length (m)': np.round(stream_network.Length.mean(),2),
-                                    'Total Segment Length (m)': np.round(stream_network.Length.sum(),2),
+                                    'Min Segment Length (m)': stream_network.Length.min(),
+                                    'Max Segment Length (m)': stream_network.Length.max(),
+                                    'Avg Segment Length (m)': stream_network.Length.mean(),
+                                    'Total Segment Length (m)': stream_network.Length.sum(),
                                     'Total Segments': stream_network.Length.count(),
                                     'Total Timesteps': len(courant_results.routing_timestep.unique()),
                                     'CN Violations': len(courant_results[courant_results['values']>= 1]),
                                     'Number of Segments Violating CN': len(bad_segments_list),
                                     'Length of Network Violating CN': violating_segs.Length.sum(),
-                                    '% Segments Violating CN': np.round(100*(len(bad_segments_list)/stream_network.Length.count()),2)
+                                    '% Segments Violating CN': 100*(len(bad_segments_list)/stream_network.Length.count())
                                     })
 
     return cn_summary_table

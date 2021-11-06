@@ -10,10 +10,10 @@ import time
 from evaluate_reference_hydrofabric import eval_reference_hydrofabric
 from shared_functions import generate_qlat, recalculate_flows, convert_results_to_df, run_troute_from_script, add_routelink_attributes, split_routelink_waterbodies, clean_dataset, replace_line, create_cn_summary_table
 import gc
+
 '''
 Notes for Mike:
     * mising segments in route link file
-    * reference hydrofabirc formatting: can we run the same processing script on the reference fabric to generate similar attributes
 TODOs:
     * create formal template for evaluation metrics
 '''
@@ -166,6 +166,7 @@ def run_troute(nts,testing_dir,qlat_type, huc_id):
         t_route_results = run_troute_from_script(str(output_filename))
         end_t_route_wall_clock  = time.time()
         print(f"{hydrofabric_version} t-route run time: {end_t_route_wall_clock  - start_t_route_wall_clock}")
+        
         # Convert results to dataframe
         fvd, courant = convert_results_to_df(t_route_results, nts, True)
 
@@ -179,12 +180,6 @@ def run_troute(nts,testing_dir,qlat_type, huc_id):
         # tidy_network_cn['collapse_flines_meters'] = collapse_flines_meters
         # tidy_network_cn['collapse_flines_main_meters'] = collapse_flines_main_meters
 
-        # # Write out CN values to aggregate table
-        # if os.path.isfile(aggregate_cn_table_filename):
-        #     tidy_network_cn.to_csv(aggregate_cn_table_filename,index=False, mode='a')
-        # else:
-        #     tidy_network_cn.to_csv(aggregate_cn_table_filename,index=False)
-
         cn_summary_table = create_cn_summary_table(tidy_network_cn, refactored_streams, hydrofabric_version)
 
         if os.path.isfile(aggregate_cn_summary_table_filename):
@@ -193,7 +188,6 @@ def run_troute(nts,testing_dir,qlat_type, huc_id):
             cn_summary_table.to_csv(aggregate_cn_summary_table_filename,index=False)
 
         del refactored_streams, t_route_results, fvd, courant, tidy_network_cn
-        # collected = gc.collect()
 
 if __name__ == '__main__':
 

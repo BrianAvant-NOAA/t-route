@@ -81,25 +81,17 @@ grid.fig.tight_layout(w_pad=1)
 ## aggregate summary tables for all RPUs
 import os
 import pandas as pd
-import json
 from pathlib import Path
-input_dir = "/data/inputs/v2.1/ngen-reference"
-reference_dir = os.listdir(input_dir)
+
 output_dir = "/data/outputs"
 rpu_dir = os.listdir(output_dir)
 
 full_calibration_table = "/data/full_calibration_table.csv"
 
-
 for rpu in rpu_dir:
-    
     summary_table_filename = Path(output_dir) / rpu / 'aggregate_cn_summary_table.csv'
     summary_table = pd.read_csv(summary_table_filename)
-    
-    # summary_table = summary_table.set_index('Network')
-    # summary_table = summary_table.drop(index=str("reference_"+ rpu))
-    # summary_table.reset_index(inplace=True)
-    # summary_table.to_csv(summary_table_filename,index=False)
+    summary_table['rpu'] = rpu
     
     if len(os.listdir(Path(output_dir) / rpu)) < 9:
         print (f"RPU {rpu} missing outputs")
@@ -109,4 +101,17 @@ for rpu in rpu_dir:
         summary_table.to_csv(full_calibration_table,index=False, mode='a',header=False)
     else:
         summary_table.to_csv(full_calibration_table,index=False)
-    
+
+'''
+'Network': [network],
+                                    'Min Segment Length (m)': stream_network.Length.min(),2),
+                                    'Max Segment Length (m)': np.round(stream_network.Length.max(),2),
+                                    'Avg Segment Length (m)': np.round(stream_network.Length.mean(),2),
+                                    'Total Segment Length (m)': np.round(stream_network.Length.sum(),2),
+                                    'Total Segments': stream_network.Length.count(),
+                                    'Total Timesteps': len(courant_results.routing_timestep.unique()),
+                                    'CN Violations': len(courant_results[courant_results['values']>= 1]),
+                                    'Number of Segments Violating CN': len(bad_segments_list),
+                                    'Length of Network Violating CN': violating_segs.Length.sum(),
+                                    '% Segments Violating CN': np.round(100*(len(bad_segments_list)/stream_network.Length.count()),2)
+'''
