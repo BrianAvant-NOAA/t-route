@@ -1,5 +1,4 @@
 import zipfile
-
 import xarray as xr
 import pandas as pd
 import geopandas as gpd
@@ -11,8 +10,19 @@ import dask.array as da
 import sys
 import math
 from datetime import *
+import pathlib
+import netCDF4
+import time
+import logging
+from joblib import delayed, Parallel
+from cftime import date2num
+
+
+
+LOG = logging.getLogger('')
 
 from troute.nhd_network import reverse_dict
+
 
 def read_netcdf(geo_file_path):
     with xr.open_dataset(geo_file_path) as ds:
@@ -59,6 +69,11 @@ def read_custom_input_new(custom_input_file):
     supernetwork_parameters = network_topology_parameters.get(
         "supernetwork_parameters", None
     )
+    preprocessing_parameters = network_topology_parameters.get(
+        "preprocessing_parameters", {}
+    )
+    if not preprocessing_parameters:
+        preprocessing_parameters = {}
     waterbody_parameters = network_topology_parameters.get("waterbody_parameters", None)
     compute_parameters = data.get("compute_parameters", {})
     forcing_parameters = compute_parameters.get("forcing_parameters", {})
@@ -73,6 +88,7 @@ def read_custom_input_new(custom_input_file):
     # TODO: add error trapping for potentially missing files
     return (
         log_parameters,
+        preprocessing_parameters,
         supernetwork_parameters,
         waterbody_parameters,
         compute_parameters,
@@ -84,6 +100,15 @@ def read_custom_input_new(custom_input_file):
         data_assimilation_parameters,
     )
 
+def read_diffusive_domain(domain_file):
+    if domain_file[-4:] == "yaml":
+        with open(domain_file) as domain:
+            data = yaml.load(domain, Loader=yaml.SafeLoader)
+    else:
+        with open(domain_file) as domain:
+            data = json.load(domain)
+            
+    return data
 
 def read_custom_input(custom_input_file):
     if custom_input_file[-4:] == "yaml":
@@ -137,7 +162,7 @@ def read_waterbody_df(waterbody_parameters, waterbodies_values, wbtype="level_po
         wb_params = waterbody_parameters[wbtype]
         return read_level_pool_waterbody_df(
             wb_params["level_pool_waterbody_parameter_file_path"],
-            wb_params["level_pool_waterbody_id"],
+            wb_params.get("level_pool_waterbody_id", 'lake_id'),
             waterbodies_values[wbtype],
         )
 
@@ -172,19 +197,67 @@ def read_level_pool_waterbody_df(
 
 
 def read_reservoir_parameter_file(
-    reservoir_parameter_file, lake_index_field="lake_id", lake_id_mask=None
+    reservoir_parameter_file, 
+    usgs_hybrid,
+    usace_hybrid,
+    rfc_forecast,
+    lake_index_field="lake_id", 
+    lake_id_mask=None,
 ):
+
     """
     Reads reservoir parameter file, which is separate from the LAKEPARM file.
+    Extracts reservoir "type" codes and returns in a DataFrame
+    type 1: Levelool
+    type 2: USGS Hybrid Persistence
+    type 3: USACE Hybrid Persistence
+    type 4: RFC
     This function is only called if Hybrid Persistence or RFC type reservoirs
     are active.
+    
+    Arguments
+    ---------
+    - reservoir_parameter_file (str): full file path of the reservoir parameter
+                                      file
+    
+    - usgs_hybrid          (boolean): If True, then USGS Hybrid DA will be coded
+    
+    - usace_hybrid         (boolean): If True, then USACE Hybrid DA will be coded
+    
+    - rfc_forecast         (boolean): If True, then RFC Forecast DA will be coded
+    
+    - lake_index_field         (str): field containing lake IDs in reservoir 
+                                      parameter file
+    
+    - lake_id_mask     (dict_values): Waterbody IDs in the model domain 
+    
+    Returns
+    -------
+    - df1 (Pandas DataFrame): Reservoir type codes, indexed by lake_id
+    
+    Notes
+    -----
+    
     """
+    
     with xr.open_dataset(reservoir_parameter_file) as ds:
         ds = ds.swap_dims({"feature_id": lake_index_field})
-
         ds_new = ds["reservoir_type"]
-
         df1 = ds_new.sel({lake_index_field: list(lake_id_mask)}).to_dataframe()
+        
+    # drop duplicate indices
+    df1 = (df1.reset_index()
+           .drop_duplicates(subset="lake_id")
+           .set_index("lake_id")
+          )
+    
+    # recode to levelpool (1) for reservoir DA types set to false
+    if usgs_hybrid == False:
+        df1[df1['reservoir_type'] == 2] = 1
+    if usace_hybrid == False:
+        df1[df1['reservoir_type'] == 3] = 1
+    if rfc_forecast == False:
+        df1[df1['reservoir_type'] == 4] = 1
 
     return df1
 
@@ -206,17 +279,57 @@ def read_qlat(path):
     """
     return get_ql_from_csv(path)
 
+def get_ql_from_chrtout(
+    f,
+    qlateral_varname = "q_lateral",
+    qbucket_varname="qBucket",
+    runoff_varname = "qSfcLatRunoff",
+):
+    '''
+    Return an array of qlateral data from a single CHRTOUT netCDF4 file.
+    If the lateral inflow variable is not present in the file, then calculate
+    lateral inflow as the sum of qbucket and surface runoff.
+    
+    Arguments
+    ---------
+    f (Path): 
+    qlateral_varname (string): lateral inflow variable name
+    qbucket_varname (string): Groundwater bucket flux variable name
+    runoff_varname (string): surface runoff variable name
+    
+    NOTES:
+    - This is very bespoke to WRF-Hydro
+    '''
+    with netCDF4.Dataset(
+        filename = f,
+        mode = 'r',
+        format = "NETCDF4"
+    ) as ds:
+        
+        all_variables = list(ds.variables.keys())
+        if qlateral_varname in all_variables:
+            dat = ds.variables[qlateral_varname][:].filled(fill_value = 0.0)
+        
+        else:
+            dat = ds.variables[qbucket_varname][:].filled(fill_value = 0.0) + \
+                ds.variables[runoff_varname][:].filled(fill_value = 0.0)
+        
+    return dat
 
 # TODO: Generalize this name -- perhaps `read_wrf_hydro_chrt_mf()`
 def get_ql_from_wrf_hydro_mf(
     qlat_files,
     index_col="feature_id",
     value_col="q_lateral",
+    gw_col="qBucket",
+    runoff_col = "qSfcLatRunoff",
 ):
     """
     qlat_files: globbed list of CHRTOUT files containing desired lateral inflows
     index_col: column/field in the CHRTOUT files with the segment/link id
     value_col: column/field in the CHRTOUT files with the lateral inflow value
+    gw_col: column/field in the CHRTOUT files with the groundwater bucket flux value
+    runoff_col: column/field in the CHRTOUT files with the runoff from terrain routing value
 
     In general the CHRTOUT files contain one value per time step. At present, there is
     no capability for handling non-uniform timesteps in the qlaterals.
@@ -254,25 +367,31 @@ def get_ql_from_wrf_hydro_mf(
 
     with xr.open_mfdataset(
         qlat_files,
-        combine="by_coords",
-        # combine="nested",
-        # concat_dim="time",
-        # data_vars="minimal",
-        # coords="minimal",
-        # compat="override",
-        preprocess=drop_all_coords,
+        combine="nested",
+        concat_dim="time",
+#         data_vars=["q_lateral","qBucket","qSfcLatRunoff"],
+        coords="minimal",
+        compat="override",
         # parallel=True,
     ) as ds:
+        
+        # if forcing file contains a variable with the specified value_col name, 
+        # then use it, otherwise compute q_lateral as the sum of qBucket and qSfcLatRunoff
+        try:
+            qlateral_data = ds[value_col].values.T
+        except:
+            qlateral_data = ds[gw_col].values.T + ds[runoff_col].values.T
+            
         try:
             ql = pd.DataFrame(
-                ds[value_col].values.T,
+                qlateral_data,
                 index=ds[index_col].values[0],
                 columns=ds.time.values,
                 # dtype=float,
             )
         except:
             ql = pd.DataFrame(
-                ds[value_col].values.T,
+                qlateral_data,
                 index=ds[index_col].values,
                 columns=ds.time.values,
                 # dtype=float,
@@ -284,69 +403,291 @@ def get_ql_from_wrf_hydro_mf(
 def drop_all_coords(ds):
     return ds.reset_coords(drop=True)
 
+def write_chanobs(
+    chanobs_filepath, 
+    flowveldepth, 
+    link_gage_df, 
+    t0, 
+    dt, 
+    nts
+):
+    
+    '''
+    Write results at gage locations to netcdf.
+    If the user specified file does not exist, create it. 
+    If the user specified file already exiss, append it. 
+    
+    Arguments
+    -------------
+        chanobs_filepath (Path or string) - 
+        flowveldepth (DataFrame) - t-route flow velocity and depth results
+        link_gage_df (DataFrame) - linkIDs of gages in network
+        t0 (datetime) - initial time
+        dt (int) - timestep duration (seconds)
+        nts (int) - number of timesteps in simulation
+        
+    Returns
+    -------------
+    
+    '''
+    
+    # array of segment linkIDs at gage locations. Results from these segments will be written
+    gage_feature_id = link_gage_df.index.to_numpy(dtype = "int32")
+    
+    # array of simulated flow data at gage locations
+    gage_flow_data = flowveldepth.loc[link_gage_df.index].iloc[:,::3].to_numpy(dtype="float32") 
+    
+    # array of simulation time
+    gage_flow_time = [t0 + timedelta(seconds = (i+1) * dt) for i in range(nts)]
+    
+    if not chanobs_filepath.is_file():
+        
+        # if no chanobs file exists, create a new one
+        # open netCDF4 Dataset in write mode
+        with netCDF4.Dataset(
+            filename = chanobs_filepath,
+            mode = 'w',
+            format = "NETCDF4"
+        ) as f:
 
-def write_q_to_wrf_hydro(
+            # =========== DIMENSIONS ===============
+            _ = f.createDimension("time", None)
+            _ = f.createDimension("feature_id", len(gage_feature_id))
+            _ = f.createDimension("reference_time", 1)
+
+            # =========== time VARIABLE ===============
+            TIME = f.createVariable(
+                varname = "time",
+                datatype = 'int32',
+                dimensions = ("time",),
+            )
+            TIME[:] = date2num(
+                gage_flow_time, 
+                units = "minutes since 1970-01-01 00:00:00 UTC",
+                calendar = "gregorian"
+            )
+            f['time'].setncatts(
+                {
+                    'long_name': 'model initialization time',
+                    'standard_name': 'forecast_reference_time',
+                    'units': 'minutes since 1970-01-01 00:00:00 UTC'
+                }
+            )
+
+            # =========== reference_time VARIABLE ===============
+            REF_TIME = f.createVariable(
+                varname = "reference_time",
+                datatype = 'int32',
+                dimensions = ("reference_time",),
+            )
+            REF_TIME[:] = date2num(
+                t0, 
+                units = "minutes since 1970-01-01 00:00:00 UTC",
+                calendar = "gregorian"
+            )
+            f['reference_time'].setncatts(
+                {
+                    'long_name': 'vaild output time',
+                    'standard_name': 'time',
+                    'units': 'minutes since 1970-01-01 00:00:00 UTC'
+                }
+            )
+
+            # =========== feature_id VARIABLE ===============
+            FEATURE_ID = f.createVariable(
+                varname = "feature_id",
+                datatype = 'int32',
+                dimensions = ("feature_id",),
+            )
+            FEATURE_ID[:] = gage_feature_id
+            f['feature_id'].setncatts(
+                {
+                    'long_name': 'Reach ID',
+                    'comment': 'NHDPlusv2 ComIDs within CONUS, arbitrary Reach IDs outside of CONUS',
+                    'cf_role:': 'timeseries_id'
+                }
+            )
+
+            # =========== streamflow VARIABLE ===============            
+            y = f.createVariable(
+                    varname = "streamflow",
+                    datatype = "f4",
+                    dimensions = ("time", "feature_id"),
+                    fill_value = np.nan
+                )
+            y[:] = gage_flow_data.reshape(
+                len(gage_flow_time),
+                len(gage_feature_id)
+            )
+
+            # =========== GLOBAL ATTRIBUTES ===============  
+            f.setncatts(
+                {
+                    'model_initialization_time': t0.strftime('%Y-%m-%d_%H:%M:%S'),
+                    'model_output_valid_time': gage_flow_time[0].strftime('%Y-%m-%d_%H:%M:%S'),
+                }
+            )
+            
+    else:
+        
+        # append data to chanobs file
+        # open netCDF4 Dataset in r+ mode to append
+        with netCDF4.Dataset(
+            filename = chanobs_filepath,
+            mode = 'r+',
+            format = "NETCDF4"
+        ) as f:
+
+            # =========== format variable data to be appended =============== 
+            time_new = date2num(
+                gage_flow_time, 
+                units = "minutes since 1970-01-01 00:00:00 UTC",
+                calendar = "gregorian"
+            )
+
+            flow_new = gage_flow_data.reshape(
+                len(gage_flow_time),
+                len(gage_feature_id)
+            )
+            
+            # =========== append new flow data =============== 
+            tshape = len(f.dimensions['time'])
+            f['time'][tshape:(tshape+nts)] = time_new
+            f['streamflow'][tshape:(tshape+nts)] = flow_new
+            
+def write_to_netcdf(f, variables, datatype = 'f4'):
+    
+    '''
+    Quickly append or overwrite variable data in NetCDF files by leveraging the netCDF4 library. 
+    For additional documentation on netCDF4: https://unidata.github.io/netcdf4-python/#version-157
+    
+    Arguments:
+    ----------
+    f (Path): Name of netCDF file to hold dataset. Can also be a python 3 pathlib instance
+    variables (dict): dictionary keys are variable names (strings), dictionary values are tuples:
+                           (
+                               variable data (numpy array - 1D must be same size as variable dimension), 
+                               variable dimension name (string) that already exist in netCDF file, 
+                               variable attributes (dict, keys are attribute names and values are attribute contents),
+                           )
+    datatype: numpy datatype object, or a string that describes a numpy dtype object.
+              Supported specifiers include: 'S1' or 'c' (NC_CHAR), 'i1' or 'b' or 'B' (NC_BYTE),
+              'u1' (NC_UBYTE), 'i2' or 'h' or 's' (NC_SHORT), 'u2' (NC_USHORT), 'i4' or 'i' or 'l' (NC_INT),
+              'u4' (NC_UINT), 'i8' (NC_INT64), 'u8' (NC_UINT64), 'f4' or 'f' (NC_FLOAT), 'f8' or 'd' (NC_DOUBLE)
+    
+    NOTES:
+    - the netCDF files we want to append/edit must have write permission!
+    '''
+    
+    with netCDF4.Dataset(
+        filename = f,
+        mode = 'r+',
+        format = "NETCDF4"
+    ) as ds:
+
+        for varname, (vardata, dim, attrs) in variables.items():
+            
+            # check that dimension exists
+            if dim not in list(ds.dimensions.keys()):
+                LOG.error("The dimensions %s could not be found in file %s" % (dim, f))
+                LOG.error("Aborting writing process for %s. No data were written to this file" % f)
+                return        
+            
+            # check that dimension size and variable data size agree
+            dim_size = ds.dimensions[dim].size
+            if vardata.size != dim_size:
+                LOG.error("Cannot write data of size %d to variable with dimension size of %d" % (vardata.size, dim_size))
+                LOG.error("Aborting writing process for %s. No data were written to this file" % f)
+                return
+            
+            # check that varname doesn't already exist
+            # if it does, then overwrite it
+            if varname in list(ds.variables.keys()):
+
+                ds[varname][:] = vardata
+
+            # if variable does not exist, create new one
+            else:
+
+                # create a new variable
+                y = ds.createVariable(
+                    varname = varname,
+                    datatype = datatype,
+                    dimensions = (dim,),
+                    fill_value = np.nan
+                )
+
+                # write data to new variable
+                y[:] = vardata
+
+                # include variable attributes
+                ds[varname].setncatts(attrs)
+                
+def write_chrtout(    
     flowveldepth,
     chrtout_files,
-    output_folder,
     qts_subdivisions,
-    new_extension="TRTE"
+    cpu_pool,
 ):
-    """
-    Write t-route simulated flows to WRF-Hydro CHRTOUT files.
+    
+    LOG.debug("Starting the write_chrtout function") 
+    
+    # count the number of simulated timesteps
+    nsteps = len(flowveldepth.loc[:,::3].columns)
+    
+    # determine how many files to write results out to
+    nfiles_to_write = int(np.floor(nsteps / qts_subdivisions))
+    
+    if nfiles_to_write >= 1:
+        
+        LOG.debug("%d CHRTOUT files will be written." % (nfiles_to_write))
+        LOG.debug("Extracting flow DataFrame on qts_subdivisions from FVD DataFrame")
+        start = time.time()
+        
+        flow = flowveldepth.loc[:, ::3].iloc[:, qts_subdivisions-1::qts_subdivisions]
+        
+        LOG.debug("Extracting flow DataFrame took %s seconds." % (time.time() - start))
+        
+        varname = 'streamflow_troute'
+        dim = 'feature_id'
+        attrs = {
+            'long_name': 'River Flow',
+            'units': 'm3 s-1',
+            'coordinates': 'latitude longitude',
+            'grid_mapping': 'crs',
+            'valid_range': np.array([0,50000], dtype = 'float32'),
+        }
+        
+        LOG.debug("Reindexing the flow DataFrame to align with `feature_id` dimension in CHRTOUT files")
+        start = time.time()
+        
+        with xr.open_dataset(chrtout_files[0]) as ds:
+            newindex = ds.feature_id.values
+            
+        qtrt = flow.reindex(newindex).to_numpy().astype("float32")
+        
+        LOG.debug("Reindexing the flow DataFrame took %s seconds." % (time.time() - start))
+        
+        LOG.debug("Writing t-route data to %d CHRTOUT files" % (nfiles_to_write))
+        start = time.time()
+        with Parallel(n_jobs=cpu_pool) as parallel:
+        
+            jobs = []
+            for i, f in enumerate(chrtout_files[:nfiles_to_write]):
 
-    Arguments:
-        flowveldepth (pandas Data Frame): t-route simulated flow, velocity and depth
-        chrtout_files (list): chrtout filepaths
-        output_folder (pathlib.Path): folder where updated chrtout files will be written
-        qts_subdivisions (int): number of t-route timesteps per WRF-hydro timesteps
-    """
-
-    # open all CHRTOUT files as a single xarray dataset
-    with xr.open_mfdataset(chrtout_files, combine="by_coords") as chrtout:
-
-        # !!NOTE: If break_at_waterbodies == True, segment feature_ids coincident with water bodies do
-        # not show up in the flowveldepth dataframe. Re-indexing inserts these missing feature_ids and
-        # populates columns with NaN values.
-        flowveldepth_reindex = flowveldepth.reindex(chrtout.feature_id.values)
-
-        # unpack, subset, and transpose t-route flow data
-        qtrt = flowveldepth_reindex.loc[:, ::3].to_numpy().astype("float32")
-        qtrt = qtrt[:, ::qts_subdivisions]
-        qtrt = np.transpose(qtrt)
-
-        # construct DataArray for t-route flows, dims, coords, and attrs consistent with CHRTOUT
-        qtrt_DataArray = xr.DataArray(
-            data=da.from_array(qtrt),
-            dims=["time", "feature_id"],
-            coords=dict(time=chrtout.time.values, feature_id=chrtout.feature_id.values),
-            attrs=dict(description="River Flow, t-route", units="m3 s-1",),
-        )
-
-        # add t-route DataArray to CHRTOUT dataset
-        chrtout["streamflow_troute"] = qtrt_DataArray
-
-        # group by time
-        grp_object = chrtout.groupby("time")
-
-    # build a list of datasets, one for each timestep
-    dataset_list = []
-    for grp, vals in iter(grp_object):
-        dataset_list.append(vals)
-
-    # save a new set of chrtout files to disk that contail t-route simulated flow
-    chrtout_files_new = [
-        output_folder / (s.name + "." + new_extension) for s in chrtout_files
-    ]
-
-    # mfdataset solution - can theoretically be parallelised via dask.distributed
-    xr.save_mfdataset(dataset_list, paths=chrtout_files_new)
-
-
-#     # pure serial solution - saving for timing tests against mfdataset
-#     for i, dat in enumerate(dataset_list):
-#         dat.to_netcdf(chrtout_files_new[i])
-
+                s = time.time()
+                variables = {
+                    varname: (qtrt[:,i], dim, attrs)
+                }
+                jobs.append(delayed(write_to_netcdf)(f, variables))
+                LOG.debug("Writing %s." % (f))
+                
+            parallel(jobs)
+               
+        LOG.debug("Writing t-route data to %d CHRTOUT files took %s seconds." % (nfiles_to_write, (time.time() - start)))
+        
+    else:
+        LOG.debug("Simulation duration is less than one qts_subdivision. No CHRTOUT files written.")
 
 def get_ql_from_wrf_hydro(qlat_files, index_col="station_id", value_col="q_lateral"):
     """
@@ -460,164 +801,107 @@ def build_filtered_gage_df(segment_gage_df, gage_col="gages"):
 
 def build_lastobs_df(
         lastobsfile,
-        routelink,
-        wrf_lastobs_flag,
-        time_shift = 0,
-        gage_id = "gages",
-        link_id = "link",
-        model_discharge_id = "model_discharge",
-        obs_discharge_id = "discharge",
-        time_idx_id = "timeInd",
-        station_id = "stationId",
-        station_idx_id = "stationIdInd",
-        time_id = "time",
-        discharge_nan = -9999.0,
-        ref_t_attr_id = "modelTimeAtOutput",
-        route_link_idx = "feature_id",
-        # last_nudge_id = "last_nudge",
+        crosswalk_file,
+        time_shift           = 0,
+        crosswalk_gage_field = "gages",
+        crosswalk_link_field = "link",
+        obs_discharge_id     = "discharge",
+        time_idx_id          = "timeInd",
+        station_id           = "stationId",
+        station_idx_id       = "stationIdInd",
+        time_id              = "time",
+        discharge_nan        = -9999.0,
+        ref_t_attr_id        = "modelTimeAtOutput",
+        route_link_idx       = "feature_id",
     ):
-
-    standard_columns = {
-        "lastobs_discharge": obs_discharge_id,
-        "time_since_lastobs": time_id,
-        "gages": gage_id,
-        "last_model_discharge": model_discharge_id
-    }
-
-    """
-    Open lastobs file, import the segment keys from the routelink_file
-    and extract discharges.
-    """
-    # TODO: We should already know the link/gage relationship by this point and can require that as an input
-    # TODO: ... so we could get rid of the following handful of lines.
-    with xr.open_dataset(routelink) as ds1:
-        gage_list = list(map(bytes.strip, ds1.gages.values))
+    '''
+    Constructs a DataFame of "lastobs" data used in streamflow DA routine
+    "lastobs" information is just like it sounds. It is the magnitude and
+    timing of the last valid observation at each gage in the model domain. 
+    We use this information to jump start initialize the DA process, both 
+    for forecast and AnA simulations. 
+    
+    Arguments
+    ---------
+    
+    Returns
+    -------
+    
+    Notes
+    -----
+    
+    '''
+    
+    # open crosswalking file and construct dataframe relating gageID to segmentID
+    with xr.open_dataset(crosswalk_file) as ds:
+        gage_list = list(map(bytes.strip, ds[crosswalk_gage_field].values))
         gage_mask = list(map(bytes.isalnum, gage_list))
-
-        gage_da = list(map(bytes.strip, ds1.gages[gage_mask].values))
-        # gage_da = ds1.gages[gage_mask].values.astype(int)
-
-        data_var_dict = {}
-        data_vars = ("link", "to", "ascendingIndex")
-        for v in data_vars:
-            data_var_dict[v] = (["gages"], ds1[v].values[gage_mask])
-        ds1 = xr.Dataset(data_vars=data_var_dict, coords={"gages": gage_da})
-        station_gage_df = ds1.to_dataframe()
-
+        gage_da   = list(map(bytes.strip, ds[crosswalk_gage_field][gage_mask].values))
+        data_var_dict = {
+            crosswalk_gage_field: gage_da,
+            crosswalk_link_field: ds[crosswalk_link_field].values[gage_mask],
+        }
+        gage_link_df = pd.DataFrame(data = data_var_dict).set_index([crosswalk_gage_field])
+            
     with xr.open_dataset(lastobsfile) as ds:
-        model_discharge_last_ts = ds[model_discharge_id][:,-1].to_dataframe()
-
-        # TODO: Determine if the df_discharges extractions can be performed
-        # exclusively on the dataset with no
-        # transformation to dataframe.
-        # ... like how we are doing for the model_discharge_last_ts
-        # NOTE: The purpose of the interpolation is to pull the last non-nan
-        # value in the time series forward to the end of the series for easy extraction.
-        # Caution should be exercised not to compare modeled values from the last
-        # time step with the last valid observed values, as these may not
-        # correspond to the same times. (See additional comment below...)
-
-        df_discharges = ds[obs_discharge_id].to_dataframe()
-        last_ts = df_discharges.index.get_level_values(time_idx_id)[-1]
-        df_discharges[df_discharges[obs_discharge_id] != discharge_nan] = df_discharges[
-            df_discharges[obs_discharge_id] != discharge_nan
-        ].interpolate(method="linear", axis=1)
-
-        discharge_last_ts = df_discharges[
-            df_discharges.index.get_level_values(time_idx_id) == last_ts
-        ]
-        # ref_time = ds.attrs[ref_t_attr_id]
+        
+        gages    = np.char.strip(ds[station_id].values)
+        
         ref_time = datetime.strptime(ds.attrs[ref_t_attr_id], "%Y-%m-%d_%H:%M:%S")
-        # lastobs_times = ds[time_id][:,-1]
-        # lastobs_times = ds[time_id].str.decode("utf-8").to_dataframe()
-        lastobs_times = pd.to_datetime(
-            ds[time_id][:,-1].to_dataframe()[time_id].str.decode("utf-8"),
-            format="%Y-%m-%d_%H:%M:%S",
-            errors='coerce',
+        
+        last_ts = ds[time_idx_id].values[-1]
+        
+        df_discharge = (
+            ds[obs_discharge_id].to_dataframe().                 # discharge to MultiIndex DF
+            replace(to_replace = discharge_nan, value = np.nan). # replace null values with nan
+            unstack(level = 0)                                   # unstack to single Index (timeInd)    
         )
-        lastobs_times = (lastobs_times - ref_time).dt.total_seconds()
+        
+        last_obs_index = (
+            df_discharge.
+            apply(pd.Series.last_valid_index).                   # index of last non-nan value, each gage
+            to_numpy()                                           # to numpy array
+        )
+        last_obs_index = np.nan_to_num(last_obs_index, nan = last_ts).astype(int)
+                        
+        last_observations = []
+        lastobs_times     = []
+        for i, idx in enumerate(last_obs_index):
+            last_observations.append(df_discharge.iloc[idx,i])
+            lastobs_times.append(ds.time.values[i, idx].decode('utf-8'))
+            
+        last_observations = np.array(last_observations)
+        lastobs_times     = pd.to_datetime(
+            np.array(lastobs_times), 
+            format="%Y-%m-%d_%H:%M:%S", 
+            errors = 'coerce'
+        )
+
+        lastobs_times = (lastobs_times - ref_time).total_seconds()
         lastobs_times = lastobs_times - time_shift
 
-        lastobs_stations = ds[station_id].to_dataframe()
-        lastobs_stations[station_id] = lastobs_stations[station_id].map(bytes.strip)
+    data_var_dict = {
+        'gages'               : gages,
+        'time_since_lastobs'  : lastobs_times,
+        'lastobs_discharge'   : last_observations
+    }
 
-        ## END OF CONTEXT (Remaining items could be outdented...)
-        model_discharge_last_ts = model_discharge_last_ts.join(lastobs_stations)
-        model_discharge_last_ts = model_discharge_last_ts.join(lastobs_times)
-        model_discharge_last_ts = model_discharge_last_ts.join(discharge_last_ts)
-        model_discharge_last_ts = model_discharge_last_ts.loc[
-            model_discharge_last_ts[model_discharge_id] != discharge_nan
+    lastobs_df = (
+        pd.DataFrame(data = data_var_dict).
+        set_index('gages').
+        join(gage_link_df, how = 'inner').
+        reset_index().
+        set_index(crosswalk_link_field)
+    )
+    lastobs_df = lastobs_df[
+        [
+            'gages',
+            'time_since_lastobs',
+            'lastobs_discharge',
         ]
-        model_discharge_last_ts = model_discharge_last_ts.reset_index().set_index(
-            station_id
-        )
-        model_discharge_last_ts = model_discharge_last_ts.drop(
-            [station_idx_id, time_idx_id], axis=1
-        )
-
-        model_discharge_last_ts[obs_discharge_id] = model_discharge_last_ts[
-            obs_discharge_id
-        ].to_frame()
-
-        # TODO: Remove any of the following comments that are no longer needed
-        # If predict from lastobs file use last obs file results
-        # if lastobs_file == "error-based":
-        # elif lastobs_file == "obs-based":  # the wrf-hydro default
-        # NOTE:  The following would compare potentially mis-matched
-        # obs/model pairs, so it is commented until we can figure out
-        # a more robust bias-type persistence.
-        # For now, we use only obs-type persistence.
-        # It would be possible to preserve a 'last_valid_bias' which would
-        # presumably correspond to the last_valid_time.
-        # # if wrf_lastobs_flag:
-        # #     model_discharge_last_ts[last_nudge_id] = (
-        # #         model_discharge_last_ts[obs_discharge_id]
-        # #         - model_discharge_last_ts[model_discharge_id]
-        # #     )
-
-        # final_df = station_gage_df.join(model_discharge_last_ts[obs_discharge_id])  # Preserve all columns
-        final_df = station_gage_df.join(model_discharge_last_ts)
-        final_df = final_df.reset_index()
-        final_df = final_df.set_index(link_id)
-        # final_df = final_df.drop([gage_id], axis=1)  # Not needed -- gage id could be useful
-        # TODO: What effect does this dropna have?
-        final_df = final_df.dropna()
-        # Translate to standard column names
-        final_df = final_df.rename(columns=reverse_dict(standard_columns))
-
-        # Else predict from the model outputs from t-route if index doesn't match interrupt computation as the results won't be valid
-        # else:
-        #     fvd_df = fvd_df
-        #     if len(model_discharge_last_ts.index) == len(fvd_df.index):
-        #         model_discharge_last_ts["last_nudge"] = (
-        #             model_discharge_last_ts["discharge"] - fvd_df[fvd_df.columns[0]]
-        #         )
-        #     else:
-        #         print("THE NUDGING FILE IDS DO NOT MATCH THE FLOWVELDEPTH IDS")
-        #         sys.exit()
-        # # Predictions created with continuously decreasing deltas until near 0 difference
-        # a = 120
-        # prediction_df = pd.DataFrame(index=model_discharge_last_ts.index)
-
-        # for time in range(0, 720, 5):
-        #     weight = math.exp(time / -a)
-        #     delta = pd.DataFrame(
-        #         model_discharge_last_ts["last_nudge"] / weight)
-
-        #     if time == 0:
-        #         prediction_df[str(time)] = model_discharge_last_ts["last_nudge"]
-        #         weight_diff = prediction_df[str(time)] - prediction_df[str(time)]
-        #     else:
-        #         if weight > 0.1:
-        #             prediction_df[str(time)] = (
-        #                 delta["last_nudge"] + model_discharge_last_ts["model_discharge"]
-        #             )
-        #         elif weight < -0.1:
-        #             prediction_df[str(time)] = (
-        #                 delta["last_nudge"] + model_discharge_last_ts["model_discharge"]
-        #             )
-        # prediction_df["0"] = model_discharge_last_ts["model_discharge"]
-        return final_df
+    ]
+    
+    return lastobs_df
 
 
 def get_usgs_df_from_csv(usgs_csv, routelink_subset_file, index_col="link"):
@@ -664,154 +948,202 @@ def get_usgs_df_from_csv(usgs_csv, routelink_subset_file, index_col="link"):
     return usgs_df
 
 
-def get_usgs_from_time_slices_folder(
-    routelink_subset_file,
-    dt,
-    usgs_files,
+def _read_timeslice_file(f):
+
+    with netCDF4.Dataset(
+        filename = f,
+        mode = 'r',
+        format = "NETCDF4"
+    ) as ds:
+        
+        discharge = ds.variables['discharge'][:].filled(fill_value = np.nan)
+        stns      = ds.variables['stationId'][:].filled(fill_value = np.nan)
+        t         = ds.variables['time'][:].filled(fill_value = np.nan)
+        qual      = ds.variables['discharge_quality'][:].filled(fill_value = np.nan)
+        
+    stationId = np.apply_along_axis(''.join, 1, stns.astype(np.str))
+    time_str = np.apply_along_axis(''.join, 1, t.astype(np.str))
+    stationId = np.char.strip(stationId)
+    
+    timeslice_observations = (pd.DataFrame({
+                                'stationId' : stationId,
+                                'datetime'  : time_str,
+                                'discharge' : discharge
+                            }).
+                             set_index(['stationId', 'datetime']).
+                             unstack(1, fill_value = np.nan)['discharge'])
+    
+    observation_quality = (pd.DataFrame({
+                                'stationId' : stationId,
+                                'datetime'  : time_str,
+                                'quality'   : qual/100
+                            }).
+                             set_index(['stationId', 'datetime']).
+                             unstack(1, fill_value = np.nan)['quality'])
+    
+    return timeslice_observations, observation_quality
+
+def get_obs_from_timeslices(
+    crosswalk_file,
+    crosswalk_gage_field,
+    crosswalk_dest_field,
+    timeslice_files,
     qc_threshold,
-    max_fill_1min,
-    t0 = None,
+    interpolation_limit,
+    frequency_secs,
+    t0,
+    cpu_pool
 ):
     """
-    routelink_subset_file - provides the gage-->segment crosswalk.
-        Only gages that are represented in the
-        crosswalk will be brought into the evaluation.
-    usgs_files - list of "time-slice" files containing observed values
-    qc_threshold - sets the lowest acceptable quality value;
-        lower values will cause the associated obs value to be discarded
-        and replaced with NaN.
-    max_fill_1min - sets the maximum interpolation length
-    t0 - optional date parameter to trim the front of the files -- if not provided,
-        the interpolated values are truncated so that the first value returned
-        corresponds to the first center date of the first provided file.
+    Read observations from TimeSlice files, interpolate available observations
+    and organize into a Pandas DataFrame
+    
+    Aguments
+    --------
+    - crosswalk_file               (str): full directory path to channel segment 
+                                          cross walk file (RouteLink.nc)
+                                          
+    - crosswalk_gage_field         (str): fieldname of gage ID data in crosswalk file
+    
+    - crosswalk_dest_field         (str): fieldname of destination data in crosswalk 
+                                          file. For streamflow DA, this is the field
+                                          containing segment IDs. For reservoir DA, 
+                                          this is the field containing waterbody IDs.
+                                          
+    - timeslice_files (list of PosixPath): Full paths to existing TimeSlice files
+    
+    - qc_threshold                  (int): Numerical observation quality 
+                                           threshold. Observations with quality
+                                           flags less than this value will be 
+                                           removed and replaced witn nan.
+                                           
+    - interpolation_limit           (int): Maximum gap duration (minuts) over 
+                                           which observations may be interpolated 
+                                           
+    - t0                       (datetime): Initialization time of simulation set
+    
+    - cpu_pool                      (int): Number of CPUs used for parallel 
+                                           TimeSlice reading
+    
+    Returns
+    -------
+    - observation_df_new (Pandas DataFrame): 
+    
+    Notes
+    -----
+    The max_fill is applied when the series is being considered at a 1 minute interval
+    so 14 minutes ensures no over-interpolation with 15-minute gage records, but creates
+    square-wave signals at gages reporting hourly...
+    therefore, we advise a 59 minute gap filling tolerance.
+    
     """
-    frequency = str(int(dt/60))+"min"
-    with read_netcdfs(usgs_files, "time", preprocess_time_station_index,) as ds2:
+    # TODO: 
+    # - Parallelize this reading for speedup using netCDF4
+    # - Generecize the function to read USACE or USGS data
+    # - only return gages that are in the model domain (consider mask application)
+        
+    # open TimeSlce files, organize data into dataframes
+    with Parallel(n_jobs=cpu_pool) as parallel:
+        jobs = []
+        for f in timeslice_files:
+            jobs.append(delayed(_read_timeslice_file)(f))
+        timeslice_dataframes = parallel(jobs)
+        
+    # create lists of observations and obs quality dataframes returned 
+    # from _read_timeslice_file
+    timeslice_obs_frames = []
+    timeslice_qual_frames = []
+    for d in timeslice_dataframes:
+        timeslice_obs_frames.append(d[0])  # TimeSlice gage observation
+        timeslice_qual_frames.append(d[1]) # TimeSlice observation qual
+        
+    # concatenate dataframes
+    timeslice_obs_df  = pd.concat(timeslice_obs_frames, axis = 1)
+    timeslice_qual_df = pd.concat(timeslice_qual_frames, axis = 1)   
+        
+    # Open the cross walk file and build a dataframe of gages and their corresponding
+    # linkID locations. This dataframe will be joined to the `timeslice_obs_df`, so 
+    # that gage observations are indexed by linkID, rather than gageID. 
+    #
+    # TODO: Re-write this section to allow the crosswalk file to be flexile. For 
+    # reservoir DA, we would use a differenct cross walk (gage<>waterbody) than 
+    # we would for streamflow DA. 
+    #
+    with xr.open_dataset(crosswalk_file) as ds:
+        
+        # assemble list of gage IDs as bytestrings, this list includes
+        # the entire gages variable from the crosswalk file, most of which
+        # are empty because most segments are not co-loacated with gages
+        gage_list = list(map(bytes.strip, ds[crosswalk_gage_field].values))
 
-        # dataframe containing discharge observations
-        df2 = pd.DataFrame(
-            ds2["discharge"].values,
-            index=ds2["stationId"].values,
-            columns=ds2.time.values,
-        )
-
-        # dataframe containing discharge quality flags [0,1]
-        df_qual = pd.DataFrame(
-            ds2["discharge_quality"].values/100,
-            index=ds2["stationId"].values,
-            columns=ds2.time.values,
-        )
-
-    with xr.open_dataset(routelink_subset_file) as ds:
-        gage_list = list(map(bytes.strip, ds.gages.values))
+        # create mask for populated (alphanumeric) gage IDs
         gage_mask = list(map(bytes.isalnum, gage_list))
+        
+        # apply mask to gage_list, isolating only populated gage IDs
+        gage_da   = list(map(bytes.strip, ds[crosswalk_gage_field][gage_mask].values))
+        
+        # convert gage IDs to unicode strings
+        gage_da   = np.asarray(gage_da).astype('<U15')
 
-        gage_da = list(map(bytes.strip, ds.gages[gage_mask].values))
-        # gage_da = ds.gages[gage_mask].values.astype(int)
-
-        data_var_dict = {}
-        data_vars = ("link", "to", "ascendingIndex")
-        for v in data_vars:
-            data_var_dict[v] = (["gages"], ds[v].values[gage_mask])
-        ds = xr.Dataset(data_vars=data_var_dict, coords={"gages": gage_da})
-    df = ds.to_dataframe()
-
-    usgs_df = (df.join(df2).
+        # package crosswalk data into a dictionary
+        data_var_dict = {
+            crosswalk_gage_field: gage_da,
+            crosswalk_dest_field: ds[crosswalk_dest_field].values[gage_mask]
+            }
+        
+        # construct crosswalk dataframe, set gage ID field as index
+        df = (pd.DataFrame(data = data_var_dict).
+              set_index(crosswalk_gage_field))
+        
+    # join crosswalk data with timeslice data, indexed on crosswalk destination field
+    observation_df = (df.join(timeslice_obs_df).
                reset_index().
-               rename(columns={"index": "gages"}).
-               set_index("link").
-               drop(["gages", "ascendingIndex", "to"], axis=1))
+               rename(columns={"index": crosswalk_gage_field}).
+               set_index(crosswalk_dest_field).
+               drop([crosswalk_gage_field], axis=1))
 
-    usgs_qual_df = (df.join(df_qual).
+    observation_qual_df = (df.join(timeslice_qual_df).
                reset_index().
-               rename(columns={"index": "gages"}).
-               set_index("link").
-               drop(["gages", "ascendingIndex", "to"], axis=1))
-
-    # Start and end times of the data obtained from the timeslice dataset
-    date_time_strs = usgs_df.columns.tolist()
-    date_time_data_start = datetime.strptime(date_time_strs[0], "%Y-%m-%d_%H:%M:%S")
-    date_time_data_end = datetime.strptime(date_time_strs[-1], "%Y-%m-%d_%H:%M:%S")
-
-    # Nominal start and end times of the data in timeslice dataset
-    # TODO: Consider the case of missing timeslice files...
-    # The current method could be fragile in the event of a
-    # missing first or last file.
-    (first_center_time, last_center_time) = get_nc_attributes(usgs_files, "sliceCenterTimeUTC", (0,-1))
-    date_time_center_start = datetime.strptime(first_center_time, "%Y-%m-%d_%H:%M:%S")
-    date_time_center_end = datetime.strptime(last_center_time, "%Y-%m-%d_%H:%M:%S")
-
-    dates = []
-    for j in pd.date_range(date_time_center_start, date_time_center_end, freq=frequency):
-        dates.append(j)
-
-    """
-    # dates_to_drop = ~usgs_df.columns.isin(dates)
-    OR
-    # dates_to_drop = usgs_df.columns.difference(dates)
-    # dates_to_add = pd.Index(dates).difference(usgs_df.columns)
-    """
-
-    # TODO: Implement a robust test verifying the intended output of the interpolation
-    """
-    The idea would be to have a function in Cython which could be called in a testable
-    framework with inputs such as the following (and corresponding expected outputs for
-    the various combinations) for use with pytest or the like:
-    ```
-    obs = [ 10, 11, 14, 18, 30, 32, 26, 20, 14, 12, 11, 10, 10, 10, 10]
-    obs_gap1 = [ None, None, None, 18, 30, 32, 26, 20, 14, 12, 11, 10, 10, 10, 10]
-    obs_gap2 = [ 10, None, None, 18, 30, 32, 26, 20, 14, 12, 11, 10, 10, 10, 10]
-    obs_gap3 = [ 10, 11, 14, None, None, None, 26, 20, 14, 12, 11, 10, 10, 10, 10]
-    obs_gap4 = [ 10, 11, 14, 18, 30, 32, 26, None, None, None, 11, 10, 10, 10, 10]
-    obs_gap5 = [ 10, 11, 14, 18, 30, 32, 26, 20, 14, 12, 11, None, None, None, None]
-    modeled_low = [ 8, 9, 12, 16, 28, 30, 24, 18, 12, 10, 9, 8, 8, 8, 8]
-    modeled_high = [ 12, 13, 16, 20, 32, 34, 28, 22, 16, 14, 13, 12, 12, 12, 12]
-    modeled_shift_late = [ 10, 10, 10, 11, 14, 18, 30, 32, 26, 20, 14, 12, 11, 10, 10]
-    modeled_shift_late = [ 11, 14, 18, 30, 32, 26, 20, 14, 12, 11, 10, 10, 10, 10, 10]
-    lastobs = {"obs":9.5, "time":0}  # Most recent observation at simulation start
-    lastobs_old = {"obs":9.5, "time":-3600}  # Most recent observation 1 hour ago
-    lastobs_NaN = {"obs":NaN, "time":NaT}  # No valid recent observation
-    ```
-    """
-
-    #TODO: separate the interpolation into a function; eventually, the data source
-    # could be something other than the time-slice files, but the interpolation
-    # might be the same and the function would facilitate taking advantage of that.
+               rename(columns={"index": crosswalk_gage_field}).
+               set_index(crosswalk_dest_field).
+               drop([crosswalk_gage_field], axis=1))
 
     # ---- Laugh testing ------
     # screen-out erroneous qc flags
-    usgs_qual_df = usgs_qual_df.mask(usgs_qual_df < 0, np.nan)
-    usgs_qual_df = usgs_qual_df.mask(usgs_qual_df > 1, np.nan)
+    observation_qual_df = (observation_qual_df.
+                           mask(observation_qual_df < 0, np.nan).
+                           mask(observation_qual_df > 1, np.nan)
+                          )
 
     # screen-out poor quality flow observations
-    usgs_df = usgs_df.mask(usgs_qual_df < qc_threshold, np.nan)
+    observation_df = (observation_df.
+                      mask(observation_qual_df < qc_threshold, np.nan).
+                      mask(observation_df <= 0, np.nan)
+                     )
 
-    # screen-out erroneous flow observations
-    usgs_df = usgs_df.mask(usgs_df <= 0, np.nan)
+    # ---- Interpolate USGS observations to the input frequency (frequency_secs)
+    observation_df_T = observation_df.transpose()             # transpose, making time the index
+    observation_df_T.index = pd.to_datetime(
+        observation_df_T.index, format = "%Y-%m-%d_%H:%M:%S"  # index variable as type datetime
+    )
+    
+    # specify resampling frequency 
+    frequency = str(int(frequency_secs/60))+"min"    
+    
+    # interpolate and resample frequency
+    observation_df_T = (observation_df_T.resample('min').
+                        interpolate(
+                            limit = interpolation_limit, 
+                            limit_direction = 'both'
+                        ).
+                        resample(frequency).
+                        asfreq()
+                       )
+    
+    # re-transpose, making link the index
+    observation_df_new = observation_df_T.transpose()
 
-    # ---- Interpolate USGS observations to time discretization of the simulation ----
-    usgs_df_T = usgs_df.transpose()
-    usgs_df_T.index = pd.to_datetime(usgs_df_T.index, format = "%Y-%m-%d_%H:%M:%S")
-
-    """
-    Note: The max_fill is applied when the series is being considered at a 1 minute interval
-    so 14 minutes ensures no over-interpolation with 15-minute gage records, but creates
-    square-wave signals at gages reporting hourly...
-    therefore, we use a 59 minute gap filling tolerance.
-    """
-    if t0:
-        date_time_center_start = t0
-    # TODO: Add reporting interval information to the gage preprocessing (timeslice generation)
-    usgs_df_T = (usgs_df_T.resample('min').
-                 interpolate(limit = max_fill_1min, limit_direction = 'both').
-                 resample(frequency).
-                 asfreq().
-                 loc[date_time_center_start:,:])
-
-    # usgs_df_T.reindex(dates)
-    usgs_df_new = usgs_df_T.transpose()
-
-    return usgs_df_new
+    return observation_df_new
 
 
 def get_param_str(target_file, param):
@@ -903,38 +1235,106 @@ def get_channel_restart_from_wrf_hydro(
     return q_initial_states
 
 
-def write_channel_restart_to_wrf_hydro(
+def read_lite_restart(
+    file
+):
+    '''
+    Open lite restart pickle files. Can open either waterbody_restart or channel_restart
+    
+    Arguments
+    -----------
+        file (string): File path to lite restart file
+        
+    Returns
+    ----------
+        df (DataFrame): restart states
+        t0 (datetime): restart datetime
+    '''
+    
+    # open pickle file to pandas DataFrame
+    df = pd.read_pickle(pathlib.Path(file))
+    
+    # extract restart time as datetime object
+    t0 = df['time'].iloc[0].to_pydatetime()
+    
+    return df.drop(columns = 'time') , t0
+    
+
+def write_lite_restart(
+    q0, 
+    waterbodies_df, 
+    t0, 
+    restart_parameters
+):
+    '''
+    Save initial conditions dataframes as pickle files
+    
+    Arguments
+    -----------
+        q0 (DataFrame):
+        waterbodies_df (DataFrame):
+        t0 (datetime.datetime):
+        restart_parameters (string):
+        
+    Returns
+    -----------
+        
+    '''
+    
+    output_directory = restart_parameters.get('lite_restart_output_directory', None)
+    if output_directory:
+        
+        # create pathlib object for output directory
+        output_path = pathlib.Path(output_directory)
+        
+        # create restart filenames
+        t0_str = t0.strftime("%Y%m%d%H%M")
+        channel_restart_filename = 'channel_restart_'+t0_str
+        waterbody_restart_filename = 'waterbody_restart_'+t0_str
+        
+        q0_out = q0.copy()
+        q0_out['time'] = t0
+        q0_out.to_pickle(pathlib.Path.joinpath(output_path, channel_restart_filename))
+        LOG.debug('Dropped lite channel restart file %s' % pathlib.Path.joinpath(output_path, channel_restart_filename))
+
+        if not waterbodies_df.empty:
+            wbody_initial_states = waterbodies_df.loc[:,['qd0','h0']]
+            wbody_initial_states['time'] = t0
+            wbody_initial_states.to_pickle(pathlib.Path.joinpath(output_path, waterbody_restart_filename))
+            LOG.debug('Dropped lite waterbody restart file %s' % pathlib.Path.joinpath(output_path, channel_restart_filename))
+        else:
+            LOG.debug('No lite waterbody restart file dropped becuase waterbodies are either turned off or do not exist in this domain.')
+        
+    else:
+        LOG.error("Not writing lite restart files. No lite_restart_output_directory variable was not specified in configuration file.")
+    
+
+def write_hydro_rst(
     data,
     restart_files,
-    output_folder,
     channel_initial_states_file,
     dt_troute,
     nts_troute,
     t0,
     crosswalk_file,
     channel_ID_column,
-    new_extension,
     restart_file_dimension_var="links",
     troute_us_flow_var_name="qlink1_troute",
     troute_ds_flow_var_name="qlink2_troute",
     troute_depth_var_name="hlink_troute",
 ):
     """
-    Write t-route flow and depth data to WRF-Hydro restart files. New WRF-Hydro restart
-    files are created that contain all of the data in the original files, plus t-route
-    flow and depth data.
+    Write t-route flow and depth data to WRF-Hydro restart files. 
 
     Agruments
     ---------
         data (Data Frame): t-route simulated flow, velocity and depth data
         restart_files (list): globbed list of WRF-Hydro restart files
-        output_folder (pathlib.Path): folder where updated restart files will be written
         channel_initial_states_file (str): WRF-HYDRO standard restart file used to initiate t-route simulation
         dt_troute (int): timestep of t-route simulation (seconds)
         nts_troute (int): number of t-route simulation timesteps
         crosswalk_file (str): File containing reservoir IDs IN THE ORDER of the Restart File
         channel_ID_column (str): field in the crosswalk file to assign as the index of the restart values
-        restart_file_dimension_var (str): name of flow and depth data dimension in the Restart File
         troute_us_flow_var_name (str):
         troute_ds_flow_var_name (str):
         troute_depth_var_name (str):
@@ -942,79 +1342,88 @@ def write_channel_restart_to_wrf_hydro(
     Returns
     -------
     """
-    # create t-route simulation timestamp array
-    # TODO: Replace this with a more general function to identify
-    # the model timesteps of a particular run.
-    # consider as a candidate something like:
-    # pd.date_range(start = datetime.strptime('2017-12-31T06:00:00',"%Y-%m-%dT%H:%M:%S"), periods = nts_troute, freq = '300s')
-    # or the equivalent resulting from
-    # pd.date_range(start = np.datetime64('2017-12-31T06:00:00'), periods = nts_troute, freq = '300s')
-    t_array = np.array(t0, dtype=np.datetime64)
+    
+    # Assemble the simulation tme domain
+    t0_array = np.array(t0, dtype=np.datetime64)
     troute_dt = np.timedelta64(dt_troute, "s")
-    troute_timestamps = t_array + np.arange(nts_troute) * troute_dt
-
-    # extract ordered feature_ids from crosswalk file
-    # TODO: Find out why we re-index this dataset when it
-    # already has a segment index.
-    with xr.open_dataset(crosswalk_file) as xds:
-        xdf = xds[channel_ID_column].to_dataframe()
-    xdf = xdf.reset_index()
-    xdf = xdf[[channel_ID_column]]
-
-    # reindex flowveldepth array
-    flowveldepth_reindex = data.reindex(xdf.link)
-
-    # TODO: The comment "revise do this one at a time" appears to be done... is it?
-    # get restart timestamps - revise do this one at a time
+    troute_timestamps = (t0_array + troute_dt) + np.arange(nts_troute) * troute_dt
+    
+    LOG.debug('t-route intialized at %s' % (np.datetime_as_string(t0_array)))
+    LOG.debug('t-route first simulated time at %s' % (np.datetime_as_string(troute_timestamps[0])))
+    LOG.debug('t-route final simulated time at %s' % (np.datetime_as_string(troute_timestamps[-1])))
+    
+    # check the Restart_Time of each restart file in the restart directory
+    LOG.debug("Looking for restart files that need to be appended")
+    start = time.time()
+    files_to_append = []
+    write_index = []
     for f in restart_files:
+        
+        # open the restart file and get the Restart_Time attribute
         with xr.open_dataset(f) as ds:
-
-            # get timestamp from restart file
             t = np.array(ds.Restart_Time.replace("_", " "), dtype=np.datetime64)
+            
+        # check if the Restart_Time is within the t-route model domain
+        a = np.where(troute_timestamps == t)[0].tolist()
+        if a:
+            files_to_append.append(f)
+            write_index.append(a[0])
+            
+    LOG.debug('Found %d restart files to append.' % len(files_to_append))
+    LOG.debug('It took %s seconds to find restart files that need to be appended' % (time.time() - start))
 
-            # find index troute_timestamp value that matches restart file timestamp
-            a = np.where(troute_timestamps == t)[0].tolist()
+    if len(files_to_append) == 0:
+        return
+    else: # contune on to append restart files
+        
+        LOG.debug('Retrieving index ordering used restart files')
+        start = time.time()
+        # extract ordered feature_ids from crosswalk file
+        # TODO: Find out why we re-index this dataset when it
+        # already has a segment index.
+        with xr.open_dataset(crosswalk_file) as xds:
+            xdf = xds[channel_ID_column].to_dataframe()
+        xdf = xdf.reset_index()
+        xdf = xdf[[channel_ID_column]]
+        LOG.debug('Retrieving index ordering took %s seconds' % (time.time() - start))
 
-            # if the restart timestamp exists in the t-route simulatuion
-            if len(a) > 0:
+        LOG.debug('Begining the restart writing process')
+        start = time.time()
+        for i, f in enumerate(files_to_append):
+            
+            LOG.debug('Preparing data for- and writing data to- %s' % f)
+            # extract and reindex depth data
+            qtrt = (
+                data.iloc[:,::3]
+                .iloc[:, a[i]]
+                .reindex(xdf.link)
+                .to_numpy()
+                .astype("float32")
+                .reshape(len(xdf.link,))
+            )
 
-                # TODO: consider Packaging the following into a function
-                # e.g., def get_restart_vals_from_fvd(a, flowveldepth, idx=0,):
-                # pull flow data from flowveldepth array, package into DataArray
-                # !! TO DO - is there a more percise way to slice flowveldepth array?
-                qtrt = (
-                    flowveldepth_reindex.iloc[:, ::3]
-                    .iloc[:, a]
-                    .to_numpy()
-                    .astype("float32")
-                )
-                qtrt = qtrt.reshape((len(flowveldepth_reindex,)))
-                qtrt_DataArray = xr.DataArray(
-                    data=qtrt, dims=[restart_file_dimension_var],
-                )
-
-                # pull depth data from flowveldepth array, package into DataArray
-                # !! TO DO - is there a more percise way to slice flowveldepth array?
-                htrt = (
-                    flowveldepth_reindex.iloc[:, 2::3]
-                    .iloc[:, a]
-                    .to_numpy()
-                    .astype("float32")
-                )
-                htrt = htrt.reshape((len(flowveldepth_reindex,)))
-                htrt_DataArray = xr.DataArray(
-                    data=htrt, dims=[restart_file_dimension_var],
-                )
-
-                # insert troute data into restart dataset
-                ds[troute_us_flow_var_name] = qtrt_DataArray
-                ds[troute_ds_flow_var_name] = qtrt_DataArray
-                ds[troute_depth_var_name] = htrt_DataArray
-
-                # write edited to disk with new filename
-                ds.to_netcdf(output_folder / (f.name + "." + new_extension))
-
-
+            # extract and reindex depth data
+            htrt = (
+                data.iloc[:, 2::3]
+                .iloc[:, a[i]]
+                .reindex(xdf.link)
+                .to_numpy()
+                .astype("float32")
+                .reshape(len(xdf.link,))
+            )
+            
+            # assemble variables dictionary with content to be written out
+            variables = {
+                troute_us_flow_var_name: (qtrt, restart_file_dimension_var, {}),
+                troute_ds_flow_var_name: (qtrt, restart_file_dimension_var, {}),
+                troute_depth_var_name: (htrt, restart_file_dimension_var, {}),
+            }
+            
+            # append restart data to netcdf restart files
+            write_to_netcdf(f, variables)
+        
+        LOG.debug('Restart writing process completed in % seconds.' % (time.time() - start))
+            
 def get_reservoir_restart_from_wrf_hydro(
     waterbody_intial_states_file,
     crosswalk_file,
@@ -1085,3 +1494,40 @@ def build_coastal_ncdf_dataframe(coastal_ncdf):
     with xr.open_dataset(coastal_ncdf) as ds:
         coastal_ncdf_df = ds[["elev", "depth"]]
         return coastal_ncdf_df.to_dataframe()
+
+
+def lastobs_df_output(
+    lastobs_df,
+    dt,
+    nts,
+    t0,
+    gages,
+    lastobs_output_folder=False,
+):
+
+    # join gageIDs to lastobs_df
+    lastobs_df = lastobs_df.join(gages)
+
+    # timestamp of last simulation timestep
+    modelTimeAtOutput = t0 + timedelta(seconds = nts * dt)
+    modelTimeAtOutput_str = modelTimeAtOutput.strftime('%Y-%m-%d_%H:%M:%S')
+
+    # timestamp of last observation
+    var = [timedelta(seconds=d) for d in lastobs_df.time_since_lastobs.fillna(0)]
+    lastobs_timestamp = [modelTimeAtOutput - d for d in var]
+    lastobs_timestamp_str = [d.strftime('%Y-%m-%d_%H:%M:%S') for d in lastobs_timestamp]
+    lastobs_timestamp_str_array = np.asarray(lastobs_timestamp_str,dtype = '|S19').reshape(len(lastobs_timestamp_str),1)
+
+    # create xarray Dataset similarly structured to WRF-generated lastobs netcdf files
+    ds = xr.Dataset(
+        {
+            "stationId": (["stationIdInd"], lastobs_df["gages"].to_numpy(dtype = '|S15')),
+            "time": (["stationIdInd", "timeInd"], np.asarray(lastobs_timestamp_str_array,dtype = '|S19')),
+            "discharge": (["stationIdInd", "timeInd"], lastobs_df["lastobs_discharge"].to_numpy().reshape(len(lastobs_df["lastobs_discharge"]),1)),
+        }
+    )
+    ds.attrs["modelTimeAtOutput"] = modelTimeAtOutput_str
+
+    # write-out LastObs file as netcdf
+    output_path = pathlib.Path(lastobs_output_folder + "/nudgingLastObs." + modelTimeAtOutput_str + ".nc").resolve()
+    ds.to_netcdf(str(output_path))

@@ -2,9 +2,16 @@ import json
 import pathlib
 import pandas as pd
 from functools import partial
+from datetime import datetime, timedelta
+from joblib import delayed, Parallel
+import netCDF4
+import numpy as np
 # TODO: Consider nio and nnw as aliases for these modules...
 import troute.nhd_io as nhd_io
 import troute.nhd_network as nhd_network
+import logging
+
+LOG = logging.getLogger('')
 
 
 def set_supernetwork_parameters(
@@ -34,11 +41,11 @@ def set_supernetwork_parameters(
     }
 
     if supernetwork not in supernetwork_options:
-        print(
+        LOG.warning(
             "Note: please call function with supernetworks set to one of the following:"
         )
         for s in supernetwork_options:
-            print(f"'{s}'")
+            LOG.warning(f"'{s}'")
         raise ValueError
 
     elif supernetwork == "Pocono_TEST1":
@@ -388,7 +395,27 @@ def set_supernetwork_parameters(
 
 
 def build_connections(supernetwork_parameters):
-    cols = supernetwork_parameters["columns"]
+    
+    cols = supernetwork_parameters.get(
+        'columns', 
+        {
+        'key'       : 'link',
+        'downstream': 'to',
+        'dx'        : 'Length',
+        'n'         : 'n',
+        'ncc'       : 'nCC',
+        's0'        : 'So',
+        'bw'        : 'BtmWdth',
+        'waterbody' : 'NHDWaterbodyComID',
+        'gages'     : 'gages',
+        'tw'        : 'TopWdth',
+        'twcc'      : 'TopWdthCC',
+        'alt'       : 'alt',
+        'musk'      : 'MusK',
+        'musx'      : 'MusX',
+        'cs'        : 'ChSlp',
+        }
+    )
     terminal_code = supernetwork_parameters.get("terminal_code", 0)
     synthetic_wb_segments = supernetwork_parameters.get("synthetic_wb_segments", None)
     synthetic_wb_id_offset = supernetwork_parameters.get("synthetic_wb_id_offset", 9.99e11)
@@ -413,11 +440,10 @@ def build_connections(supernetwork_parameters):
     if "mask_file_path" in supernetwork_parameters:
         data_mask = nhd_io.read_mask(
             pathlib.Path(supernetwork_parameters["mask_file_path"]),
-            layer_string=supernetwork_parameters["mask_layer_string"],
+            layer_string=supernetwork_parameters.get("mask_layer_string", None),
         )
-        param_df = param_df.filter(
-            data_mask.iloc[:, supernetwork_parameters["mask_key"]], axis=0
-        )
+        data_mask = data_mask.set_index(data_mask.columns[0])
+        param_df = param_df.filter(data_mask.index, axis=0)
 
     # Rename parameter columns to standard names: from route-link names
     #        key: "link"
@@ -487,7 +513,7 @@ def build_waterbodies(
     wbody_conn = nhd_network.extract_waterbody_connections(
         segment_reservoir_df,
         waterbody_crosswalk_column,
-        supernetwork_parameters["waterbody_null_code"],
+        supernetwork_parameters.get('waterbody_null_code', -9999),
     )
 
     # TODO: Add function to read LAKEPARM.nc here
@@ -532,10 +558,10 @@ def build_channel_initial_state(
         q0 = nhd_io.get_channel_restart_from_wrf_hydro(
             restart_parameters["wrf_hydro_channel_restart_file"],
             restart_parameters["wrf_hydro_channel_ID_crosswalk_file"],
-            restart_parameters["wrf_hydro_channel_ID_crosswalk_file_field_name"],
-            restart_parameters["wrf_hydro_channel_restart_upstream_flow_field_name"],
-            restart_parameters["wrf_hydro_channel_restart_downstream_flow_field_name"],
-            restart_parameters["wrf_hydro_channel_restart_depth_flow_field_name"],
+            restart_parameters.get("wrf_hydro_channel_ID_crosswalk_file_field_name", 'link'),
+            restart_parameters.get("wrf_hydro_channel_restart_upstream_flow_field_name", 'qlink1'),
+            restart_parameters.get("wrf_hydro_channel_restart_downstream_flow_field_name", 'qlink2'),
+            restart_parameters.get("wrf_hydro_channel_restart_depth_flow_field_name", 'hlink'),
         )
     else:
         # Set cold initial state
@@ -551,8 +577,124 @@ def build_channel_initial_state(
     return q0
 
 
+def build_forcing_sets(
+    forcing_parameters,
+    t0
+):
+    
+    run_sets = forcing_parameters.get("qlat_forcing_sets", None)
+    qlat_input_folder = forcing_parameters.get("qlat_input_folder", None)
+    nts = forcing_parameters.get("nts", None)
+    max_loop_size = forcing_parameters.get("max_loop_size", 12)
+    dt = forcing_parameters.get("dt", None)
+
+    try:
+        qlat_input_folder = pathlib.Path(qlat_input_folder)
+        assert qlat_input_folder.is_dir() == True
+    except TypeError:
+        raise TypeError("Aborting simulation because no qlat_input_folder is specified in the forcing_parameters section of the .yaml control file.") from None
+    except AssertionError:
+        raise AssertionError("Aborting simulation because the qlat_input_folder:", qlat_input_folder,"does not exist. Please check the the qlat_input_folder variable is correctly entered in the .yaml control file") from None
+    
+    forcing_glob_filter = forcing_parameters.get("qlat_file_pattern_filter", "*.CHRTOUT_DOMAIN1")
+        
+    # TODO: Throw errors if insufficient input data are available
+
+    if run_sets:
+        
+        # append final_timestamp variable to each set_list
+        qlat_input_folder = pathlib.Path(qlat_input_folder)
+        for (s, _) in enumerate(run_sets):
+            final_chrtout = qlat_input_folder.joinpath(run_sets[s]['qlat_files'
+                    ][-1])
+            final_timestamp_str = nhd_io.get_param_str(final_chrtout,
+                    'model_output_valid_time')
+            run_sets[s]['final_timestamp'] = \
+                datetime.strptime(final_timestamp_str, '%Y-%m-%d_%H:%M:%S')
+            
+    elif qlat_input_folder:
+        
+        # Construct run_set dictionary from user-specified parameters
+    
+        # get the first and seconded files from an ordered list of all forcing files
+        qlat_input_folder = pathlib.Path(qlat_input_folder)
+        all_files = sorted(qlat_input_folder.glob(forcing_glob_filter))
+        first_file = all_files[0]
+        second_file = all_files[1]
+
+        # Deduce the timeinterval of the forcing data from the output timestamps of the first
+        # two ordered CHRTOUT files
+        t1 = nhd_io.get_param_str(first_file, "model_output_valid_time")
+        t1 = datetime.strptime(t1, "%Y-%m-%d_%H:%M:%S")
+        t2 = nhd_io.get_param_str(second_file, "model_output_valid_time")
+        t2 = datetime.strptime(t2, "%Y-%m-%d_%H:%M:%S")
+        dt_qlat_timedelta = t2 - t1
+        dt_qlat = dt_qlat_timedelta.seconds
+
+        # determine qts_subdivisions
+        qts_subdivisions = dt_qlat / dt
+        if dt_qlat % dt == 0:
+            qts_subdivisions = dt_qlat / dt
+
+        # the number of files required for the simulation
+        nfiles = int(np.ceil(nts / qts_subdivisions))
+
+        # list of forcing file datetimes
+        datetime_list = [t0 + dt_qlat_timedelta * (n + 1) for n in
+                         range(nfiles)]
+        datetime_list_str = [datetime.strftime(d, '%Y%m%d%H%M') for d in
+                             datetime_list]
+
+        # list of forcing files
+        forcing_filename_list = [d_str + ".CHRTOUT_DOMAIN1" for d_str in
+                                 datetime_list_str]
+        
+        # check that all forcing files exist
+        for f in forcing_filename_list:
+            try:
+                J = pathlib.Path(qlat_input_folder.joinpath(f))     
+                assert J.is_file() == True
+            except AssertionError:
+                raise AssertionError("Aborting simulation because forcing file", J, "cannot be not found.") from None
+                
+        # build run sets list
+        run_sets = []
+        k = 0
+        j = 0
+        nts_accum = 0
+        nts_last = 0
+        while k < len(forcing_filename_list):
+            run_sets.append({})
+
+            if k + max_loop_size < len(forcing_filename_list):
+                run_sets[j]['qlat_files'] = forcing_filename_list[k:k
+                    + max_loop_size]
+            else:
+                run_sets[j]['qlat_files'] = forcing_filename_list[k:]
+
+            nts_accum += len(run_sets[j]['qlat_files']) * qts_subdivisions
+            if nts_accum <= nts:
+                run_sets[j]['nts'] = int(len(run_sets[j]['qlat_files'])
+                                         * qts_subdivisions)
+            else:
+                run_sets[j]['nts'] = int(nts - nts_last)
+
+            final_chrtout = qlat_input_folder.joinpath(run_sets[j]['qlat_files'
+                    ][-1])
+            final_timestamp_str = nhd_io.get_param_str(final_chrtout,
+                    'model_output_valid_time')
+            run_sets[j]['final_timestamp'] = \
+                datetime.strptime(final_timestamp_str, '%Y-%m-%d_%H:%M:%S')
+
+            nts_last = nts_accum
+            k += max_loop_size
+            j += 1
+    
+    return run_sets
+
 def build_qlateral_array(
     forcing_parameters,
+    cpu_pool,
     segment_index=pd.Index([]),
     ts_iterator=None,
     file_run_size=None,
@@ -578,22 +720,28 @@ def build_qlateral_array(
             "qlat_file_index_col", "feature_id"
         )
         qlat_file_value_col = forcing_parameters.get("qlat_file_value_col", "q_lateral")
+        gw_bucket_col = forcing_parameters.get("qlat_file_gw_bucket_flux_col","qBucket")
+        terrain_ro_col = forcing_parameters.get("qlat_file_terrain_runoff_col","qSfcLatRunoff")
+        
+        # Parallel reading of qlateral data from CHRTOUT
+        with Parallel(n_jobs=cpu_pool) as parallel:
 
-        qlat_df = nhd_io.get_ql_from_wrf_hydro_mf(
-            qlat_files=qlat_files,
-            #ts_iterator=ts_iterator,
-            #file_run_size=file_run_size,
-            index_col=qlat_file_index_col,
-            value_col=qlat_file_value_col,
-        )
+            jobs = []
+            for f in qlat_files:
+                jobs.append(delayed(nhd_io.get_ql_from_chrtout)(f))
+            ql_list = parallel(jobs)
 
+        # get feature_id from a single CHRTOUT file
+        with netCDF4.Dataset(qlat_files[0]) as ds:
+            idx = ds.variables[qlat_file_index_col][:].filled()
+
+        # package data into a DataFrame
+        qlat_df = pd.DataFrame(
+            np.stack(ql_list).T,
+            index = idx,
+            columns = range(len(qlat_files))
+        )    
         qlat_df = qlat_df[qlat_df.index.isin(segment_index)]
-
-    # TODO: These four lines seem extraneous
-    #    df_length = len(qlat_df.columns)
-    #    for x in range(df_length, 144):
-    #        qlat_df[str(x)] = 0
-    #        qlat_df = qlat_df.astype("float32")
 
     elif qlat_input_file:
         qlat_df = nhd_io.get_ql_from_csv(qlat_input_file)
@@ -618,43 +766,276 @@ def build_qlateral_array(
     return qlat_df
 
 
+def build_parity_sets(parity_parameters, run_sets):
+    
+    parity_sets = parity_parameters.get("parity_check_compare_file_sets", None)
+    
+    if parity_sets:
+        pass
+    
+    else:
+    
+        parity_sets = []
+        for (i, set_dict) in enumerate(run_sets):
+            parity_sets.append({})
+            parity_sets[i]['validation_files'] = run_sets[i]['qlat_files']
+    
+    return parity_sets
+
+def _check_timeslice_exists(filenames, timeslices_folder):
+    """
+    Check that each TimeSlice file in a list of files exists. Return a list of 
+    available files.
+    
+    Arguments
+    ---------
+    - filenames               (list of str): TimeSlice filenames
+    - timeslices_folder (pathlib.PosixPath): TimeSlice directory
+    
+    Returns
+    -------
+    - filenames_existing (list of chr): Existing TimeSlice filenames in 
+                                        TimeSlice directory
+    
+    Notes
+    -----
+    - This is a utility function used by build_da_sets
+    
+    """
+    
+    # check that all USGS TimeSlice files in the set actually exist
+    drop_list = []
+    for f in filenames:
+        try:
+            J = pathlib.Path(timeslices_folder.joinpath(f))     
+            assert J.is_file() == True
+        except AssertionError:
+            LOG.warning("Missing TimeSlice file %s", J)
+            drop_list.append(f)
+
+    # Assemble a list of existing TimeSlice files, only
+    filenames_existing = [x for x in filenames if x not in drop_list]   
+    
+    return filenames_existing
+
+def build_da_sets(da_params, run_sets, t0):
+    """
+    Create set lists of USGS and/or USACE TimeSlice files used for 
+    streamflow and reservoir data assimilation
+    
+    Arguments
+    --------
+    - da_params (dict): user-input data assimilation parameters
+    - run_sets (list) : forcing files for each run set in the simlation
+    - t0 (datetime)   : model initialization time
+    
+    Returns
+    -------
+    - da_sets (list)  : lists of USGS and USACE TimeSlice files for each run set 
+                        in the simulation
+    
+    Notes
+    -----
+    
+    """
+    
+    # check for user-input usgs and usace timeslice directories
+    usgs_timeslices_folder = da_params.get(
+        "usgs_timeslices_folder",
+        None
+    )
+    usace_timeslices_folder = da_params.get(
+        "usace_timeslices_folder",
+        None
+    )
+    
+    # User-specified DA ON/OFF preferences
+    usace_da = False
+    usgs_da = False
+    reservoir_da = da_params.get('reservoir_da', False)
+    if reservoir_da:
+        usgs_da = reservoir_da.get('reservoir_persistence_usgs', False)
+        usace_da = reservoir_da.get('reservoir_persistence_usace', False)
+    
+    nudging = False
+    streamflow_da = da_params.get('streamflow_da', False)
+    if streamflow_da:
+        nudging = streamflow_da.get('streamflow_nudging', False)
+        
+    if not usgs_da and not usace_da and not nudging:
+        # if all DA capabilities are OFF, return empty dictionary
+        da_sets = [{} for _ in run_sets]
+    
+    # if no user-input timeslice folders, a list of empty dictionaries
+    elif not usgs_timeslices_folder and not usace_timeslices_folder:
+        # if no timeslice folders, return empty dictionary
+        da_sets = [{} for _ in run_sets]
+        
+    # if user-input timeslice folders are present, build TimeSlice sets
+    else:
+        
+        # create Path objects for each TimeSlice directory
+        if usgs_timeslices_folder:
+            usgs_timeslices_folder = pathlib.Path(usgs_timeslices_folder)
+        if usace_timeslices_folder:
+            usace_timeslices_folder = pathlib.Path(usace_timeslices_folder)
+        
+        # the number of timeslice files appended to the front- and back-ends
+        # of the TimeSlice file interpolation stack
+        pad_hours = da_params.get("timeslice_lookback_hours",0)
+        timeslice_pad = pad_hours * 4 # number of 15 minute TimeSlices in the pad
+
+        # timedelta of TimeSlice data - typically 15 minutes
+        dt_timeslice = timedelta(minutes = 15)
+
+        da_sets = [] # initialize list to store TimeSlice set lists
+        
+        # Loop through each run set and build lists of available TimeSlice files
+        for (i, set_dict) in enumerate(run_sets):
+            
+            # Append an empty dictionary to the loop, which be used to hold
+            # lists of USGS and USACE TimeSlice files.
+            da_sets.append({})
+
+            # timestamps of TimeSlice files desired for run set i
+            timestamps = pd.date_range(
+                t0 - dt_timeslice * timeslice_pad,
+                run_sets[i]['final_timestamp'] + dt_timeslice * 4,
+                freq=dt_timeslice
+            )
+
+            # identify available USGS TimeSlices in run set i
+            if (usgs_timeslices_folder and nudging) or (usgs_timeslices_folder and usgs_da):
+                filenames_usgs = (timestamps.strftime('%Y-%m-%d_%H:%M:%S') 
+                            + '.15min.usgsTimeSlice.ncdf').to_list()
+                
+                # identify available USGS TimeSlices
+                filenames_usgs = _check_timeslice_exists(
+                    filenames_usgs, 
+                    usgs_timeslices_folder
+                )
+                
+                # Add available TimeSlices to da_sets list
+                da_sets[i]['usgs_timeslice_files'] = filenames_usgs
+                
+            # identify available USACE TimeSlices in run set i
+            if usace_timeslices_folder and usace_da:
+                filenames_usace = (timestamps.strftime('%Y-%m-%d_%H:%M:%S') 
+                            + '.15min.usaceTimeSlice.ncdf').to_list()
+                
+                # identify available USACE TimeSlices
+                filenames_usace = _check_timeslice_exists(
+                    filenames_usace, 
+                    usace_timeslices_folder
+                )
+                
+                # Add available TimeSlices to da_sets list
+                da_sets[i]['usace_timeslice_files'] = filenames_usace
+
+            # reset initialization time for loop set i+1
+            t0 = run_sets[i]['final_timestamp']
+            
+    return da_sets
+    
 def build_data_assimilation(data_assimilation_parameters, run_parameters):
     lastobs_df, da_parameter_dict = build_data_assimilation_lastobs(data_assimilation_parameters)
     usgs_df = build_data_assimilation_usgs_df(data_assimilation_parameters, run_parameters, lastobs_df.index)
     return usgs_df, lastobs_df, da_parameter_dict
 
-def build_data_assimilation_usgs_df(
-    data_assimilation_parameters,
+'''
+def build_streamflow_da_data(
+    streamflow_da_parameters,
     run_parameters,
     lastobs_index=None,
 ):
-    data_assimilation_csv = data_assimilation_parameters.get(
-        "data_assimilation_csv", None
-    )
-    data_assimilation_folder = data_assimilation_parameters.get(
-        "data_assimilation_timeslices_folder", None
+    """
+    Construct DataFrame of USGS gage observations for streamflow DA.
+    
+    Arguments
+    ---------
+    - streamflow_da_parameters (dict): Parameters controlling DA data assembly
+    - run_parameters           (dict): Simulation run parameters
+    - lastobs_index    (Pandas Index): ????
+    
+    Returns
+    -------
+    - usgs_df (DataFrame): qa/qc'd and interpolated USGS gage observations from 
+                           USGS TimeSlice files for streamflow DA
+    
+    Notes
+    -----
+    
+    """
+
+    # directory containing USGS TimeSlice files
+    usgs_timeslices_folder = streamflow_da_parameters.get(
+        "usgs_timeslices_folder", None
     )
 
+    # initialize empty dataframe to contain gage observations
     usgs_df = pd.DataFrame()
+
+    if usgs_timeslices_folder:
+        
+        # convert timeslices_folder from str to PosixPath
+        usgs_timeslices_folder = pathlib.Path(
+            usgs_timeslices_folder
+        )
+        
+        if "usgs_timeslice_files" in streamflow_da_parameters:
+                
+            usgs_files = streamflow_da_parameters.get("usgs_timeslice_files", None)
+            usgs_files = [usgs_timeslices_folder.joinpath(f) for f in usgs_files]
+            
+            if usgs_files: 
+
+                usgs_df = nhd_io.get_obs_from_timeslices(
+                    streamflow_da_parameters["crosswalk_file"],
+                    streamflow_da_parameters["crosswalk_gage_field"],
+                    streamflow_da_parameters["crosswalk_segID_field"],
+                    usgs_files,
+                    streamflow_da_parameters["qc_threshold"],
+                    streamflow_da_parameters["interpolation_limit"],
+                    run_parameters["dt"],
+                    run_parameters["t0"],
+                )
+        
     if not isinstance(lastobs_index, pd.Index):
         lastobs_index = pd.Index()
-
-    if data_assimilation_csv:
-        usgs_df = build_data_assimilation_csv(data_assimilation_parameters)
-    elif data_assimilation_folder:
-        usgs_df = build_data_assimilation_folder(data_assimilation_parameters, run_parameters)
-
+        
     if not lastobs_index.empty:
         if not usgs_df.empty and not usgs_df.index.equals(lastobs_index):
-            print("USGS Dataframe Index Does Not Match Last Observations Dataframe Index")
+            LOG.warning("USGS Dataframe Index Does Not Match Last Observations Dataframe Index")
             usgs_df = usgs_df.loc[lastobs_index]
 
     return usgs_df
-
+'''
 
 def build_data_assimilation_lastobs(data_assimilation_parameters):
-    # TODO: Fix the Logic here according to the following.
-
+    '''
+    A middle man function that assembles inputs for and calls
+    nhd_io.build_lastobs_df, which constructs the lastobs dataframe used for 
+    streamflow data assimilation. 
+    
+    Also, this function creates a dictionary of data assimilation parameters
+    that gets passed down to the compute kernels. 
+    
+    Arguments
+    ---------
+    - data_assimilation_parameters (dict): user-input data assimilation parameters
+    
+    Returns
+    -------
+    - lastobs_df (Pandas DataFrame):
+    
+    - da_parameter_dict      (dict):
+    
+    Notes
+    -----
+    - TODO: package additional parameters into da_parameter_dict
+    '''
+    
+    # TODO: Fix the Logic here according to the following:
     # If there are any observations for data assimilation, there
     # needs to be a complete set in the first time set or else
     # there must be a "LastObs". If there is a complete set in
@@ -663,25 +1044,54 @@ def build_data_assimilation_lastobs(data_assimilation_parameters):
     # with an empty usgs dataframe.
 
     lastobs_df = pd.DataFrame()
-    lastobs_file = data_assimilation_parameters.get("wrf_hydro_lastobs_file", None)
-    lastobs_start = data_assimilation_parameters.get(
-        "wrf_hydro_lastobs_lead_time_relative_to_simulation_start_time", 0
+    
+    streamflow_da_parameters = data_assimilation_parameters.get(
+        'streamflow_da',
+        None
     )
-    lastobs_type = data_assimilation_parameters.get("wrf_lastobs_type", "error-based")
-    lastobs_crosswalk_file = data_assimilation_parameters.get(
-        "wrf_hydro_da_channel_ID_crosswalk_file", None
-    )
-
-    if lastobs_file:
-        lastobs_df = nhd_io.build_lastobs_df(
-            lastobs_file,
-            lastobs_crosswalk_file,
-            lastobs_type,  # TODO: Confirm that we are using this; delete it if not.
-            lastobs_start,
+    
+    if streamflow_da_parameters:
+        
+        # determine if user explictly requests streamflow DA
+        nudging = streamflow_da_parameters.get(
+            'streamflow_nudging', 
+            False
         )
+            
+        if nudging:
+            
+            lastobs_file = streamflow_da_parameters.get(
+                "wrf_hydro_lastobs_file",
+                None
+            )
+            
+            lastobs_start = streamflow_da_parameters.get(
+                "wrf_hydro_lastobs_lead_time_relative_to_simulation_start_time",
+                0
+            )
+            
+            lastobs_type = streamflow_da_parameters.get(
+                "wrf_lastobs_type", 
+                "error-based"
+            )
+        
+            lastobs_crosswalk_file = streamflow_da_parameters.get(
+                "gage_segID_crosswalk_file",
+                None
+            )
+
+            if lastobs_file:
+                lastobs_df = nhd_io.build_lastobs_df(
+                    lastobs_file,
+                    lastobs_crosswalk_file,
+                    lastobs_start,
+                )
 
     da_parameter_dict = {}
-    da_parameter_dict["da_decay_coefficient"] = data_assimilation_parameters.get("da_decay_coefficient", 120)
+    da_parameter_dict["da_decay_coefficient"] = data_assimilation_parameters.get(
+        "da_decay_coefficient", 
+        120
+    )
     # TODO: Add parameters here for interpolation length (14/59), QC threshold (1.0)
 
     return lastobs_df, da_parameter_dict
@@ -709,16 +1119,19 @@ def build_data_assimilation_folder(data_assimilation_parameters, run_parameters)
         usgs_files = data_assimilation_parameters.get("usgs_timeslice_files", None)
         usgs_files = [usgs_timeslices_folder.joinpath(f) for f in usgs_files]
     else:
-        print("No Files Found for DA")
+        LOG.warning("No Files Found for DA")
         # TODO: Handle this with a real exception
 
-    usgs_df = nhd_io.get_usgs_from_time_slices_folder(
-        data_assimilation_parameters["wrf_hydro_da_channel_ID_crosswalk_file"],
-        run_parameters["dt"],
-        usgs_files,
-        data_assimilation_parameters.get("qc_threshold", 1),
-        data_assimilation_parameters.get("data_assimilation_interpolation_limit", 59),
-        run_parameters["t0"],
-    )
+    if usgs_files:
+        usgs_df = nhd_io.get_obs_from_timeslices(
+            data_assimilation_parameters["wrf_hydro_da_channel_ID_crosswalk_file"],
+            usgs_files,
+            data_assimilation_parameters.get("qc_threshold", 1),
+            data_assimilation_parameters.get("data_assimilation_interpolation_limit", 59),
+            run_parameters["dt"],
+            run_parameters["t0"],
+        )
+    else:
+        usgs_df = pd.DataFrame()
 
     return usgs_df
